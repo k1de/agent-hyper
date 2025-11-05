@@ -1,0 +1,29 @@
+{
+    "name": "agent-hyper",
+    "version": "1.0.0",
+    "description": "HTTP/HTTPS proxy agents with keep-alive support",
+    "main": "index.js",
+    "types": "index.d.ts",
+    "exports": {
+        ".": {
+            "require": "./index.js",
+            "import": "./index.mjs",
+            "types": "./index.d.ts"
+        },
+        "./*": "./*.js"
+    },
+    "scripts": {},
+    "engines": {
+        "node": ">=14"
+    },
+    "keywords": [
+        "agent",
+        "http",
+        "https",
+        "proxy",
+        "keep-alive",
+        "tunnel"
+    ],
+    "author": "tish",
+    "license": "ISC"
+}

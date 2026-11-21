@@ -1,18 +1,25 @@
 {
     "name": "agent-hyper",
     "version": "1.0.0",
-    "description": "HTTP/HTTPS proxy agents with keep-alive support",
+    "description": "HTTP/HTTPS proxy agents and a reusable HTTP/2 client transport for Node.js",
     "main": "index.js",
     "types": "index.d.ts",
+    "files": [
+        "*.js",
+        "*.mjs",
+        "*.d.ts"
+    ],
     "exports": {
         ".": {
+            "types": "./index.d.ts",
             "require": "./index.js",
-            "import": "./index.mjs",
-            "types": "./index.d.ts"
+            "import": "./index.mjs"
         },
         "./*": "./*.js"
     },
-    "scripts": {},
+    "scripts": {
+        "test": "node --test test/*.test.cjs"
+    },
     "engines": {
         "node": ">=14"
     },
@@ -25,5 +32,8 @@
         "tunnel"
     ],
     "author": "tish",
-    "license": "ISC"
+    "license": "ISC",
+    "devDependencies": {
+        "axios": "^1.21.1"
+    }
 }

@@ -2,6 +2,9 @@ const https = require('https');
 const http = require('http');
 const { isIP, isIPv6 } = require('net');
 
+// Node's timers reject or clamp values above 2^31 - 1 (`setTimeout` fires them after 1 ms), so 0 (no timer) is used instead.
+const normalizeTimeout = (value) => (value > 0 && value <= 2 ** 31 - 1 ? value : 0);
+
 /**
  * Creates a connection through HTTP(S) proxy using CONNECT method
  * @param {URL} proxy - Proxy URL object
@@ -65,4 +68,4 @@ function createProxyConnection(proxy, proxyRequestOptions, options, callback) {
     return request.end();
 }
 
-module.exports = createProxyConnection;
+module.exports = { createProxyConnection, normalizeTimeout };

@@ -204,7 +204,7 @@ test('a clean close before SETTINGS reports the interrupted setup stage', async 
 });
 
 test('opening timeout defaults to five seconds; zero or Infinity disables it', { timeout: 3000 }, async () => {
-    assert.equal(resolveHttp2TransportOptions().timeout, 5000);
+    for (const options of [undefined, { timeout: undefined }]) assert.equal(resolveHttp2TransportOptions(options).timeout, 5000);
     for (const timeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ timeout }).timeout, 0);
     const server = await proxy([origin]);
     server.on('connect', (_, peer) => {
@@ -366,7 +366,7 @@ test('pool close drains active streams while a new session serves the same origi
 });
 
 test('idle sessions close after idleTimeout (ten seconds by default) and stay open with zero', { timeout: 3000 }, async (t) => {
-    assert.equal(resolveHttp2TransportOptions().idleTimeout, 10000);
+    for (const options of [undefined, { idleTimeout: undefined }]) assert.equal(resolveHttp2TransportOptions(options).idleTimeout, 10000);
     for (const idleTimeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ idleTimeout }).idleTimeout, 0);
     const idle = { ...options(), idleTimeout: 50 };
     const transportPool = createHttp2TransportPool(idle);

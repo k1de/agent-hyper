@@ -2,25 +2,27 @@ const http2 = require('http2');
 const { errorMonitor } = require('events');
 const { isIP, isIPv6 } = require('net');
 const tls = require('tls');
-const createProxyConnection = require('./proxy-connection');
+const { createProxyConnection, normalizeTimeout } = require('./proxy-connection');
 
 const excludedRequestHeaders = new Set([
     'host', 'connection', 'proxy-connection', 'keep-alive', 'transfer-encoding',
     'upgrade', 'proxy-authorization', 'proxy-authenticate', 'http2-settings',
 ]);
 
+const http2TransportDefaults = {
+    timeout: 5000,
+    idleTimeout: 10000,
+};
+
 const streamWindowSize = 6 * 1024 * 1024;
 const connectionWindowSize = 15 * 1024 * 1024;
-
-// Node turns timer values outside (0, 2^31) into 1 ms, so 0 (no timer) is used for them instead.
-const normalizeTimeout = (value) => (value > 0 && value < 2 ** 31 ? value : 0);
 
 // Shallow copies keep the options fixed when the caller later reuses its objects.
 function resolveHttp2TransportOptions(options = {}) {
     return {
         proxy: options.proxy == null ? null : new URL(options.proxy),
-        timeout: normalizeTimeout(options.timeout ?? 5000),
-        idleTimeout: normalizeTimeout(options.idleTimeout ?? 10000),
+        timeout: normalizeTimeout(options.timeout ?? http2TransportDefaults.timeout),
+        idleTimeout: normalizeTimeout(options.idleTimeout ?? http2TransportDefaults.idleTimeout),
         proxyRequestOptions: { ...options.proxyRequestOptions, headers: { ...options.proxyRequestOptions?.headers } },
         originTls: { ...options.originTls },
     };

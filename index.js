@@ -1,6 +1,6 @@
 const https = require('https');
 const http = require('http');
-const createProxyConnection = require('./proxy-connection');
+const { createProxyConnection, normalizeTimeout } = require('./proxy-connection');
 const { createHttp2Transport } = require('./http2-transport');
 const createHttp2TransportPool = require('./http2-transport-pool');
 
@@ -9,18 +9,25 @@ const proxyAgentDefaults = {
     keepAliveMsecs: 1000,
     scheduling: 'lifo',
     timeout: 5000,
+    idleTimeout: 10000,
 };
 
 // createConnection must not return a value: http.Agent would treat it as a ready socket.
 const withProxy = (Agent) => class extends Agent {
     constructor({ proxy, proxyRequestOptions, ...options }) {
-        super({ ...proxyAgentDefaults, ...options });
+        // `options` is a fresh rest copy, so filling it in place is safe; explicit `undefined` gets the default too.
+        for (const [key, value] of Object.entries(proxyAgentDefaults)) options[key] ??= value;
+        const { timeout, idleTimeout, ...agentOptions } = options;
+        // http.Agent applies its own `timeout` to idle keep-alive sockets, so CONNECT keeps a separate limit.
+        super({ ...agentOptions, timeout: normalizeTimeout(idleTimeout) });
         this.proxy = typeof proxy === 'string' ? new URL(proxy) : proxy;
         this.proxyRequestOptions = proxyRequestOptions || {};
+        this.connectTimeout = normalizeTimeout(timeout);
     }
 
     tunnel(options, callback) {
-        createProxyConnection(this.proxy, this.proxyRequestOptions, { ...options, keepAlive: this.keepAlive }, callback);
+        createProxyConnection(this.proxy, this.proxyRequestOptions,
+            { ...options, keepAlive: this.keepAlive, timeout: this.connectTimeout }, callback);
     }
 };
 

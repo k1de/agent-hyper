@@ -9,19 +9,33 @@ HTTP/HTTPS proxy agents and an HTTP/2 client transport for Node.js 20+.
 npm install agent-hyper
 ```
 
+> **Disclaimer:** always pass `proxy: false` to axios. Otherwise axios may apply a global proxy from `HTTP_PROXY` /
+> `HTTPS_PROXY` on top of the agent or transport, and requests may not go through them as configured.
+
 ## Proxy agents
 
 ```javascript
 import axios from 'axios'
 import { HttpsProxyAgent } from 'agent-hyper' // HttpProxyAgent for http:// targets
 
-const client = axios.create({ httpsAgent: new HttpsProxyAgent({ proxy: 'http://user:pass@localhost:8080' }) })
+const client = axios.create({
+    httpsAgent: new HttpsProxyAgent({ proxy: 'http://user:pass@localhost:8080' }),
+    proxy: false,
+})
 await client.get('https://api.example.org/users')
 ```
 
-Credentials go in the proxy URL. `proxyRequestOptions` sets CONNECT headers and TLS options for an HTTPS proxy.
-Defaults: `keepAlive: true`, `keepAliveMsecs: 1000`, `scheduling: 'lifo'`, `timeout: 5000` — override any of them.
-Here `timeout` caps the wait for the proxy's CONNECT reply and closes idle keep-alive sockets.
+| Option | Description | Default |
+| --- | --- | --- |
+| `proxy` | Proxy URL; credentials go in it (`http://user:pass@host:port`) | required |
+| `proxyRequestOptions` | `headers`, `ca`, `cert`, `key`, `rejectUnauthorized` for the CONNECT request | — |
+| `timeout` | Limit for connecting to the proxy and its CONNECT reply (not covered by axios `timeout` by default), ms | `5000` |
+| `idleTimeout` | Closes a keep-alive socket after this long without requests, ms | `10000` |
+| `keepAlive` | Reuses sockets between requests | `true` |
+| `keepAliveMsecs` | Delay before TCP keep-alive probes on an idle socket, ms | `1000` |
+| `scheduling` | Which free socket is reused first | `'lifo'` |
+
+Other `http.Agent` / `https.Agent` options pass through. `0` or `Infinity` disables a timer.
 
 ## HTTP/2 transport
 
@@ -34,16 +48,20 @@ It does not reconnect: once `transport.accepting` is `false`, create a new one.
 ```javascript
 import { createHttp2Transport } from 'agent-hyper'
 
-const transport = await createHttp2Transport('https://api.example.org', { proxy: 'http://localhost:8080' })
+const transport = await createHttp2Transport('https://api.example.org', {
+    proxy: 'http://localhost:8080',
+})
 try {
-    await axios.post('https://api.example.org/orders', { quantity: 1 }, { transport, proxy: false })
+    await axios.post('https://api.example.org/orders', { quantity: 1 }, {
+        transport,
+        proxy: false,
+    })
 } finally {
     await transport.close()
 }
 ```
 
-`proxy: false` keeps axios from applying a global proxy (`HTTP_PROXY`, `HTTPS_PROXY`) on top of the transport,
-which would fail with `HTTP/2 REQUEST ORIGIN MISMATCH`. Axios does not follow redirects when a custom `transport` is set.
+Axios does not follow redirects when a custom `transport` is set.
 
 **Pool** — for long-lived clients, with one origin or many: one shared session per origin,
 reopened on the next `get()` after it closes.
@@ -59,18 +77,23 @@ const client = async config => axios({
 })
 
 await client({ url: 'https://api-a.example.org/users' })
-await client({ method: 'post', baseURL: 'https://api-b.example.net', url: '/orders', data: { quantity: 1 } })
+await client({
+    method: 'post',
+    baseURL: 'https://api-b.example.net',
+    url: '/orders',
+    data: { quantity: 1 },
+})
 ```
 
 Both take the same options:
 
-| Option | Default | |
+| Option | Description | Default |
 | --- | --- | --- |
-| `proxy` | — | Proxy URL; omit for a direct connection |
-| `proxyRequestOptions` | — | Same as for the agents |
-| `originTls` | — | `ca`, `cert`, `key`, `rejectUnauthorized` for the origin |
-| `timeout` | `5000` | Limit for the whole connection setup, ms |
-| `idleTimeout` | `10000` | Closes a session after this long with no requests in flight, ms |
+| `proxy` | Proxy URL; omit for a direct connection | — |
+| `proxyRequestOptions` | Same as for the agents | — |
+| `originTls` | `ca`, `cert`, `key`, `rejectUnauthorized` for the origin | — |
+| `timeout` | Limit for the whole connection setup, ms | `5000` |
+| `idleTimeout` | Closes a session after this long with no requests in flight, ms | `10000` |
 
 `0` (as in axios) or `Infinity` disables a timer. Idle sessions never keep the process alive.
 

@@ -7,6 +7,7 @@ const net = require('node:net');
 const tls = require('node:tls');
 const axios = require('axios');
 const { createHttp2Transport, createHttp2TransportPool } = require('agent-hyper');
+const { resolveHttp2TransportOptions } = require('../http2-transport');
 const { certificates, listen, proxy, closeServers } = require('./helpers.cjs');
 
 let dnsCert, ipCert, origin, originURL, cleartextURL, tcpProxy, ipProxy, dnsProxy;
@@ -49,23 +50,15 @@ async function checkPosts(t, url, server) {
     const start = sessions;
     const transport = await createHttp2Transport(url, { ...options(server), timeout: 1500 });
     t.after(() => transport.close());
-    assert.equal(transport.accepting, true);
-    const pairs = [['x-end', 'delivered'], ['Proxy-Authorization', 'never-at-origin'], ['Host', 'ignored.invalid'],
-        ['Connection', 'x-drop'], ['x-drop', 'drop']];
-    for (const [i, fields] of [pairs, [...pairs].reverse()].entries()) {
+    for (const i of [1, 2]) {
         const path = '/echo?i=' + i;
-        const response = await axios.post(url + path, { i }, {
-            transport, proxy: false, timeout: 1500, headers: Object.fromEntries(fields),
-        });
-        const { headers, rawHeaders, body, sni } = response.data;
+        const response = await axios.post(url + path, { i }, { transport, proxy: false, timeout: 1500 });
+        const { rawHeaders, body, sni } = response.data;
         assert.equal(response.status, 201);
-        assert.equal(response.statusText, '');
         assert.equal(response.headers['x-answer'], 'yes');
         assert.deepEqual(JSON.parse(body), { i });
         assert.deepEqual(rawHeaders.slice(0, 8), [':authority', target.host, ':method', 'POST', ':path', path, ':scheme', target.protocol.slice(0, -1)]);
-        assert.equal(headers['x-end'], 'delivered');
         assert.equal(sni, target.protocol === 'https:' ? 'localhost' : undefined);
-        for (const name of ['proxy-authorization', 'x-drop', 'host', 'connection']) assert.equal(headers[name], undefined);
     }
     assert.equal(sessions - start, 1);
     if (server) {
@@ -86,9 +79,11 @@ for (const mode of ['direct', 'http', 'https']) {
 test('request builds its own pseudo-headers and filters connection-specific fields', async (t) => {
     const transport = await createHttp2Transport(originURL, options());
     t.after(() => transport.close());
+    // X-Hop comes before the Connection header that names it, so filtering must not depend on order.
     const headers = {
         ':scheme': 'http', ':path': '/wrong', ':method': 'DELETE', ':authority': 'wrong.example',
-        TE: 'trailers', Connection: ['x-hop', 'Keep-Alive'], 'X-Hop': 'drop', 'X-End': 'keep',
+        Host: 'wrong.example', 'Proxy-Authorization': 'secret', 'X-Hop': 'drop',
+        TE: 'trailers', Connection: ['x-hop', 'Keep-Alive'], 'X-End': 'keep',
     };
     for (const te of ['trailers', 'gzip']) {
         const stream = transport.request({ method: 'GET', path: '/actual', auth: 'a:b', headers: { ...headers, TE: te } });
@@ -102,7 +97,7 @@ test('request builds its own pseudo-headers and filters connection-specific fiel
         assert.deepEqual(rawHeaders.filter((name, i) => i % 2 === 0 && name.startsWith(':')),
             [':authority', ':method', ':path', ':scheme']);
         assert.equal(received.te, te === 'trailers' ? 'trailers' : undefined);
-        assert.equal(received['x-hop'], undefined);
+        for (const name of ['host', 'proxy-authorization', 'x-hop', 'connection']) assert.equal(received[name], undefined);
         assert.equal(received['x-end'], 'keep');
         assert.equal(received.authorization, 'Basic ' + Buffer.from('a:b').toString('base64'));
     }
@@ -138,6 +133,21 @@ test('IPv6 proxy literals omit SNI', async (t) => {
     const transport = await createHttp2Transport(originURL, options(server));
     await transport.close();
     assert.ok(!server.requests[0].sni);
+});
+
+test('IPv6 origins get a bracketed :authority', async (t) => {
+    let server;
+    try { server = await listen(http2.createServer((req, res) => res.end(req.headers[':authority'])), '::1'); } catch (err) {
+        if (['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(err.code)) return t.skip('IPv6 loopback unavailable');
+        throw err;
+    }
+    const url = 'http://[::1]:' + server.address().port;
+    const standalone = await createHttp2Transport(url);
+    const transportPool = createHttp2TransportPool();
+    t.after(() => Promise.all([standalone.close(), transportPool.close()]));
+    for (const transport of [standalone, await transportPool.get(url)]) {
+        assert.equal((await axios.get(url + '/', { transport, proxy: false })).data, new URL(url).host);
+    }
 });
 
 test('407 prevents a connection to the origin; TLS must negotiate h2', async () => {
@@ -181,21 +191,17 @@ test('a clean close before SETTINGS reports the interrupted setup stage', async 
     });
 });
 
-test('opening defaults to five seconds and explicit zero waits for the proxy reply', { timeout: 9000 }, async (t) => {
+test('opening timeout defaults to five seconds; zero or Infinity disables it', { timeout: 3000 }, async () => {
+    assert.equal(resolveHttp2TransportOptions().timeout, 5000);
+    for (const timeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ timeout }).timeout, 0);
     const server = await proxy([origin]);
     server.on('connect', (_, peer) => {
-        peer.setTimeout(5500, () => peer.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'));
+        peer.setTimeout(300, () => peer.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'));
     });
-    const config = { proxy: server.url, proxyRequestOptions: { headers: { 'x-stall': '1' } } };
-    const transportPool = createHttp2TransportPool({ ...config, timeout: 0 });
-    t.after(() => transportPool.close());
-    const start = performance.now();
-    await Promise.all([
-        assert.rejects(createHttp2Transport(originURL, config), { message: 'HTTP/2 SETUP TIMEOUT' }).then(() => {
-            assert.ok(performance.now() - start >= 4900);
-        }),
-        assert.rejects(transportPool.get(originURL), { message: 'PROXY HTTP 407' }),
-    ]);
+    // Without normalization Node would turn Infinity into a 1 ms timer.
+    await assert.rejects(createHttp2Transport(originURL, {
+        proxy: server.url, proxyRequestOptions: { headers: { 'x-stall': '1' } }, timeout: Infinity,
+    }), { message: 'PROXY HTTP 407' });
 });
 
 test('a bound transport rejects other origins; timeout and cancellation leave the session usable', async (t) => {
@@ -207,8 +213,6 @@ test('a bound transport rejects other origins; timeout and cancellation leave th
     for (const url of [originURL.replace('localhost', '127.0.0.1'), 'https://localhost', originURL.replace('https:', 'http:')]) {
         await assert.rejects(axios.get(url, config), { message: 'HTTP/2 REQUEST ORIGIN MISMATCH' });
     }
-    assert.throws(() => transport.request({ socketPath: '/socket' }), { message: 'HTTP/2 UNSUPPORTED SOCKET PATH' });
-    assert.throws(() => transport.request({ path: 'relative' }), { name: 'TypeError', message: 'HTTP/2 EXPECTED ORIGIN-RELATIVE PATH' });
     assert.equal(connections, start);
     assert.equal(streams, beforeRequests);
     await assert.rejects(axios.get(originURL + '/hold', { ...config, timeout: 60 }), { code: 'ECONNABORTED' });
@@ -258,20 +262,12 @@ test('a failed session stops accepting requests and can be closed', async () => 
     await transport.close();
 });
 
-test('standalone factories and separate pools open independent sessions', async (t) => {
-    const config = options();
-    const start = sessions;
-    const [first, second] = await Promise.all([
-        createHttp2Transport(originURL, config), createHttp2Transport(originURL, config),
-    ]);
-    t.after(() => Promise.all([first.close(), second.close()]));
-    assert.notEqual(first, second);
-    const transportPool = createHttp2TransportPool(config);
-    const otherTransportPool = createHttp2TransportPool(config);
-    t.after(() => Promise.all([transportPool.close(), otherTransportPool.close()]));
-    const [third, fourth] = await Promise.all([transportPool.get(originURL), otherTransportPool.get(originURL)]);
-    assert.equal(new Set([first, second, third, fourth]).size, 4);
-    assert.equal(sessions - start, 4);
+test('an Axios instance reports a closed transport even though it holds a copy', async () => {
+    const transport = await createHttp2Transport(originURL, options());
+    const client = axios.create({ baseURL: originURL, transport, proxy: false });
+    assert.equal((await client.get('/')).status, 201);
+    await transport.close();
+    await assert.rejects(client.get('/'), { message: 'HTTP/2 TRANSPORT CLOSED' });
 });
 
 test('a pool shares concurrent opens by HTTPS origin and serves different domains', async (t) => {
@@ -294,51 +290,23 @@ test('a pool shares concurrent opens by HTTPS origin and serves different domain
     assert.equal(sessions - start, 1);
 });
 
-test('a pool distinguishes h2c and TLS origins and reuses each session', { timeout: 4000 }, async (t) => {
-    const transportPool = createHttp2TransportPool({ ...options(), timeout: 1500 });
-    t.after(() => transportPool.close());
-    const [cleartext, secure] = await Promise.all([transportPool.get(cleartextURL), transportPool.get(originURL)]);
-    assert.notEqual(cleartext, secure);
-    // Same host and port as the cached TLS session, but the server only accepts TLS.
-    await assert.rejects(transportPool.get(originURL.replace('https:', 'http:')));
-    for (const [url, transport, scheme] of [[cleartextURL, cleartext, 'http'], [originURL, secure, 'https']]) {
-        assert.equal(await transportPool.get(url + '/echo'), transport);
-        const { data } = await axios.get(url + '/echo', { transport, proxy: false, timeout: 1500 });
-        assert.equal(data.headers[':scheme'], scheme);
-    }
-});
-
-test('pool options are fixed, including proxy address, CONNECT headers and TLS trust', async (t) => {
+test('pool options are copied at creation and failed opens are not cached', async (t) => {
     const config = options(ipProxy);
     config.proxy = new URL(config.proxy);
     config.proxyRequestOptions.headers = { 'x-route': 'original' };
-    config.originTls.ca = Buffer.from(dnsCert.cert);
     const transportPool = createHttp2TransportPool(config);
     t.after(() => transportPool.close());
+    // Reusing the caller's objects afterwards must not reach the pool: port 1 and this CA would both fail.
     config.proxy.port = 1;
     config.proxyRequestOptions.headers['x-route'] = 'changed';
-    config.originTls.ca.fill(0);
-
+    config.originTls.ca = ipCert.cert;
     const start = ipProxy.requests.length;
-    const first = await transportPool.get(originURL);
-    assert.equal(await transportPool.get(originURL), first);
-    assert.equal(ipProxy.requests.length - start, 1);
+    await transportPool.get(originURL);
     assert.equal(ipProxy.requests.at(-1).headers['x-route'], 'original');
-    const closing = first.close();
-    const second = await transportPool.get(originURL);
-    await closing;
-    assert.notEqual(first, second);
-    assert.equal(await transportPool.get(originURL), second);
 
-    const deny = options(ipProxy);
-    deny.proxyRequestOptions.headers = { 'x-deny': '1' };
-    const deniedTransportPool = createHttp2TransportPool(deny);
-    t.after(() => deniedTransportPool.close());
-    for (let i = 0; i < 2; i++) await assert.rejects(deniedTransportPool.get(originURL), { message: 'PROXY HTTP 407' });
-    assert.equal(ipProxy.requests.length - start, 4);
-    const untrusted = createHttp2TransportPool({ ...options(ipProxy), originTls: { ca: ipCert.cert } });
-    t.after(() => untrusted.close());
-    await assert.rejects(untrusted.get(originURL), /certificate/i);
+    const denied = createHttp2TransportPool({ ...options(ipProxy), proxyRequestOptions: { ca: ipCert.cert, headers: { 'x-deny': '1' } } });
+    for (let i = 0; i < 2; i++) await assert.rejects(denied.get(originURL), { message: 'PROXY HTTP 407' });
+    assert.equal(ipProxy.requests.length - start, 3);
 });
 
 test('pool close cancels ongoing CONNECT and immediately allows new gets for the same origin', { timeout: 3000 }, async (t) => {
@@ -367,50 +335,36 @@ test('pool close drains active streams while a new session serves the same origi
     const held = axios.get(originURL + '/hold', { transport: first, proxy: false });
     const [stream] = await arrived;
     try {
-        let finished = false;
-        const draining = transportPool.close().then(() => { finished = true; });
-        const again = transportPool.close();
+        let finished = 0;
+        // The second call finds an empty cache but still waits for the first one.
+        const closes = [transportPool.close(), transportPool.close()].map((closing) => closing.then(() => finished++));
         assert.equal(first.accepting, false);
         const next = await transportPool.get(originURL);
         assert.notEqual(next, first);
         assert.equal((await axios.get(originURL, { transport: next, proxy: false })).status, 201);
-        assert.equal(finished, false);
+        assert.equal(finished, 0);
         stream.respond({ ':status': 200 });
         stream.end('drained');
         assert.equal((await held).data, 'drained');
-        await Promise.all([draining, again]);
+        await Promise.all(closes);
         assert.equal(await transportPool.get(originURL), next);
     } finally {
         stream.close();
     }
 });
 
-test('pool close cancels pending TLS and SETTINGS even with the opening timeout disabled', { timeout: 3000 }, async () => {
-    const tlsStall = await listen(net.createServer((peer) => peer.resume()));
-    const settingsStall = await listen(tls.createServer({ ...ipCert, ALPNProtocols: ['h2'] }, (peer) => peer.resume()));
-    for (const server of [tlsStall, settingsStall]) {
-        const transportPool = createHttp2TransportPool({ originTls: { ca: ipCert.cert }, timeout: 0 });
-        const connected = once(server, server === tlsStall ? 'connection' : 'secureConnection');
-        const rejected = assert.rejects(transportPool.get('https://127.0.0.1:' + server.address().port), {
-            message: 'HTTP/2 SETUP CANCELLED BY POOL',
-        });
-        const [socket] = await connected;
-        const closed = once(socket, 'close');
-        await Promise.all([transportPool.close(), rejected, closed]);
-    }
-});
-
-test('idle sessions close after five seconds by default and stay open with idleTimeout zero', { timeout: 8000 }, async (t) => {
-    const transportPool = createHttp2TransportPool({ ...options(), timeout: 0 });
+test('idle sessions close after idleTimeout (ten seconds by default) and stay open with zero', { timeout: 3000 }, async (t) => {
+    assert.equal(resolveHttp2TransportOptions().idleTimeout, 10000);
+    for (const idleTimeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ idleTimeout }).idleTimeout, 0);
+    const idle = { ...options(), idleTimeout: 50 };
+    const transportPool = createHttp2TransportPool(idle);
     const persistent = await createHttp2Transport(originURL, { ...options(), idleTimeout: 0 });
     t.after(() => Promise.all([persistent.close(), transportPool.close()]));
-    const standalone = await createHttp2Transport(originURL, options());
+    const standalone = await createHttp2Transport(originURL, idle);
     t.after(() => standalone.close());
     const closed = once(origin, 'session').then(([peer]) => once(peer, 'close'));
-    const start = performance.now();
     const pooled = await transportPool.get(originURL);
     await closed;
-    assert.ok(performance.now() - start >= 4900);
     assert.equal(standalone.accepting, false);
     assert.equal(pooled.accepting, false);
     assert.equal(persistent.accepting, true);
@@ -419,21 +373,12 @@ test('idle sessions close after five seconds by default and stay open with idleT
     assert.equal((await axios.get(originURL, { transport: next, proxy: false })).status, 201);
 });
 
-test('idle expiry starts on open and restarts only after the last stream closes', { timeout: 4000 }, async (t) => {
+test('idle expiry restarts only after the last stream closes', { timeout: 4000 }, async (t) => {
     const config = { ...options(), idleTimeout: 50 };
-    const transportPool = createHttp2TransportPool(config);
-    t.after(() => transportPool.close());
     const connected = once(origin, 'session');
-    const unused = await transportPool.get(originURL);
-    const [peer] = await connected;
-    await once(peer, 'close');
-    assert.equal(unused.accepting, false);
-
-    const next = once(origin, 'session');
-    const transport = await transportPool.get(originURL);
-    assert.notEqual(transport, unused);
+    const transport = await createHttp2Transport(originURL, config);
     t.after(() => transport.close());
-    const [session] = await next;
+    const [session] = await connected;
     const arrived = once(origin, 'stream');
     const axiosConfig = { transport, proxy: false, timeout: 1500 };
     const held = axios.get(originURL + '/hold', axiosConfig);

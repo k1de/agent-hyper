@@ -1,8 +1,7 @@
 const https = require('https');
 const http = require('http');
-const { URL } = require('url');
 const createProxyConnection = require('./proxy-connection');
-const createHttp2Transport = require('./http2-transport');
+const { createHttp2Transport } = require('./http2-transport');
 const createHttp2TransportPool = require('./http2-transport-pool');
 
 const proxyAgentDefaults = {
@@ -12,35 +11,28 @@ const proxyAgentDefaults = {
     timeout: 5000,
 };
 
-class HttpProxyAgent extends http.Agent {
-    constructor(options) {
-        const { proxy, proxyRequestOptions, ...opts } = options;
-        super({ ...proxyAgentDefaults, ...opts });
+// createConnection must not return a value: http.Agent would treat it as a ready socket.
+const withProxy = (Agent) => class extends Agent {
+    constructor({ proxy, proxyRequestOptions, ...options }) {
+        super({ ...proxyAgentDefaults, ...options });
         this.proxy = typeof proxy === 'string' ? new URL(proxy) : proxy;
         this.proxyRequestOptions = proxyRequestOptions || {};
     }
 
+    tunnel(options, callback) {
+        createProxyConnection(this.proxy, this.proxyRequestOptions, { ...options, keepAlive: this.keepAlive }, callback);
+    }
+};
+
+class HttpProxyAgent extends withProxy(http.Agent) {
     createConnection(options, callback) {
-        createProxyConnection(this.proxy, this.proxyRequestOptions,
-            { ...options, keepAlive: this.keepAlive }, callback);
+        this.tunnel(options, callback);
     }
 }
 
-class HttpsProxyAgent extends https.Agent {
-    constructor(options) {
-        const { proxy, proxyRequestOptions, ...opts } = options;
-        super({ ...proxyAgentDefaults, ...opts });
-        this.proxy = typeof proxy === 'string' ? new URL(proxy) : proxy;
-        this.proxyRequestOptions = proxyRequestOptions || {};
-    }
-
+class HttpsProxyAgent extends withProxy(https.Agent) {
     createConnection(options, callback) {
-        createProxyConnection(this.proxy, this.proxyRequestOptions,
-            { ...options, keepAlive: this.keepAlive }, (err, socket) => {
-                if (err) return callback(err, null);
-                const secureSocket = super.createConnection({ ...options, socket });
-                callback(null, secureSocket);
-            });
+        this.tunnel(options, (err, socket) => (err ? callback(err, null) : callback(null, super.createConnection({ ...options, socket }))));
     }
 }
 

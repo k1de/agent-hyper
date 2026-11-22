@@ -1,10 +1,9 @@
-const createHttp2Transport = require('./http2-transport');
+const { openTransport, resolveHttp2TransportOptions } = require('./http2-transport');
 
 function createHttp2TransportPool(options) {
-    const settings = createHttp2Transport.resolveHttp2TransportOptions(options);
+    const settings = resolveHttp2TransportOptions(options);
     const byOrigin = new Map();
-    // A retired session can still have streams to drain after its replacement opens.
-    const live = new Set();
+    let closing = Promise.resolve();
 
     return {
         async get(url) {
@@ -14,29 +13,30 @@ function createHttp2TransportPool(options) {
             const cached = byOrigin.get(key);
             if (cached && (!cached.transport || cached.transport.accepting)) return cached.opening;
 
-            const entry = {
-                onClose() {
-                    live.delete(entry);
-                    if (byOrigin.get(key) === entry) byOrigin.delete(key);
+            const entry = { controller: new AbortController() };
+            const forget = () => byOrigin.get(key) === entry && byOrigin.delete(key);
+            entry.opening = openTransport(key, settings, { onClose: forget, signal: entry.controller.signal }).then(
+                (transport) => (entry.transport = transport),
+                (err) => {
+                    forget();
+                    throw err;
                 },
-            };
-            live.add(entry);
+            );
             byOrigin.set(key, entry);
-            entry.opening = createHttp2Transport(key, settings, entry).catch((err) => {
-                entry.onClose();
-                throw err;
-            });
             return entry.opening;
         },
 
+        // Sessions retired after GOAWAY or an error are already closing on their own.
         async close() {
-            const current = Array.from(live);
+            const entries = Array.from(byOrigin.values());
             byOrigin.clear();
-            await Promise.all(current.map((entry) => {
-                if (entry.transport) return entry.transport.close();
-                entry.cancelOpening?.();
-                return entry.opening.catch(() => {});
+            const current = Promise.all(entries.map((entry) => {
+                entry.controller.abort(new Error('HTTP/2 SETUP CANCELLED BY POOL'));
+                return entry.transport ? entry.transport.close() : entry.opening.then((transport) => transport.close(), () => {});
             }));
+            // Each call also waits for earlier calls that are still draining.
+            closing = Promise.all([closing, current]).then(() => {});
+            await closing;
         },
     };
 }

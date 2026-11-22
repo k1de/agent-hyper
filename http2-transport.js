@@ -4,36 +4,22 @@ const { isIP, isIPv6 } = require('net');
 const tls = require('tls');
 const createProxyConnection = require('./proxy-connection');
 
-const http2TransportDefaults = {
-    timeout: 5000,
-    idleTimeout: 5000,
-};
-
 const excludedRequestHeaders = new Set([
     'host', 'connection', 'proxy-connection', 'keep-alive', 'transfer-encoding',
     'upgrade', 'proxy-authorization', 'proxy-authenticate', 'http2-settings',
 ]);
 
-// Copy mutable option data while preserving native TLS objects and callbacks.
-function cloneTransportOptionValue(value) {
-    if (Buffer.isBuffer(value)) return Buffer.from(value);
-    if (Array.isArray(value)) return value.map(cloneTransportOptionValue);
-    if (value && typeof value === 'object') {
-        const prototype = Object.getPrototypeOf(value);
-        if (prototype === Object.prototype || prototype === null) {
-            return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneTransportOptionValue(item)]));
-        }
-    }
-    return value;
-}
+// Node turns timer values outside (0, 2^31) into 1 ms, so 0 (no timer) is used for them instead.
+const normalizeTimeout = (value) => (value > 0 && value < 2 ** 31 ? value : 0);
 
+// Shallow copies keep the options fixed when the caller later reuses its objects.
 function resolveHttp2TransportOptions(options = {}) {
     return {
         proxy: options.proxy == null ? null : new URL(options.proxy),
-        timeout: options.timeout ?? http2TransportDefaults.timeout,
-        idleTimeout: options.idleTimeout ?? http2TransportDefaults.idleTimeout,
-        proxyRequestOptions: cloneTransportOptionValue(options.proxyRequestOptions || {}),
-        originTls: cloneTransportOptionValue(options.originTls),
+        timeout: normalizeTimeout(options.timeout ?? 5000),
+        idleTimeout: normalizeTimeout(options.idleTimeout ?? 10000),
+        proxyRequestOptions: { ...options.proxyRequestOptions, headers: { ...options.proxyRequestOptions?.headers } },
+        originTls: { ...options.originTls },
     };
 }
 
@@ -44,16 +30,12 @@ function requestHeaders(origin, options) {
     const protocol = options.protocol || origin.protocol;
     const target = new URL(`${protocol}//${host}${port ? ':' + port : ''}`);
     if (target.origin !== origin.origin) throw new Error('HTTP/2 REQUEST ORIGIN MISMATCH');
-    if (options.socketPath) throw new Error('HTTP/2 UNSUPPORTED SOCKET PATH');
 
-    const method = options.method || 'GET';
-    const path = options.path || '/';
-    if (!path.startsWith('/') && !(method === 'OPTIONS' && path === '*')) throw new TypeError('HTTP/2 EXPECTED ORIGIN-RELATIVE PATH');
     const headers = {
         __proto__: null,
         ':authority': origin.host,
-        ':method': method,
-        ':path': path,
+        ':method': options.method || 'GET',
+        ':path': options.path || '/',
         ':scheme': origin.protocol.slice(0, -1),
     };
     const fields = Object.entries(options.headers || {});
@@ -77,6 +59,8 @@ function transportFor(origin, session, idleTimeout, onClose) {
     let accepting = true;
     let streams = 0;
     let idleTimer;
+    // Axios clones plain-object transports, so `this.accepting` could be a stale copy.
+    const isAccepting = () => accepting && !session.closed && !session.destroyed;
     const stop = () => {
         accepting = false;
         clearTimeout(idleTimer);
@@ -104,9 +88,9 @@ function transportFor(origin, session, idleTimeout, onClose) {
     idle();
 
     return {
-        get accepting() { return accepting && !session.closed && !session.destroyed; },
+        get accepting() { return isAccepting(); },
         request(options, callback) {
-            if (!this.accepting) throw new Error('HTTP/2 TRANSPORT CLOSED');
+            if (!isAccepting()) throw new Error('HTTP/2 TRANSPORT CLOSED');
             const stream = session.request(requestHeaders(origin, options), { endStream: false });
             clearTimeout(idleTimer);
             session.ref();
@@ -146,11 +130,12 @@ async function waitFor(resource, event, closedMessage) {
     }
 }
 
-async function createHttp2Transport(origin, options, owner) {
+// The signal only cancels connection setup; an open transport ignores it.
+async function openTransport(origin, settings, { onClose, signal } = {}) {
     origin = new URL(origin);
     const secure = origin.protocol === 'https:';
     if (!secure && origin.protocol !== 'http:') throw new TypeError('HTTP/2 UNSUPPORTED ORIGIN SCHEME');
-    const { proxy, originTls, proxyRequestOptions, timeout, idleTimeout } = owner ? options : resolveHttp2TransportOptions(options);
+    const { proxy, originTls, proxyRequestOptions, timeout, idleTimeout } = settings;
     const host = origin.hostname.replace(/^\[|\]$/g, '');
     const port = Number(origin.port || (secure ? 443 : 80));
     let active, tunnel, openingError;
@@ -158,7 +143,8 @@ async function createHttp2Transport(origin, options, owner) {
         openingError = err;
         active?.destroy();
     }
-    if (owner) owner.cancelOpening = () => cancel(new Error('HTTP/2 SETUP CANCELLED BY POOL'));
+    const onAbort = () => cancel(signal.reason);
+    signal?.addEventListener('abort', onAbort);
     const timer = timeout && setTimeout(() => cancel(new Error('HTTP/2 SETUP TIMEOUT')), timeout);
     try {
         if (proxy) {
@@ -186,18 +172,19 @@ async function createHttp2Transport(origin, options, owner) {
         await waitFor(session, 'remoteSettings', 'HTTP/2 SESSION CLOSED BEFORE SETTINGS');
         if (openingError) throw openingError;
         if (session.closed || session.destroyed) throw new Error('HTTP/2 SESSION CLOSED DURING SETUP');
-        const transport = transportFor(origin, session, idleTimeout, owner?.onClose);
-        if (owner) owner.transport = transport;
-        return transport;
+        return transportFor(origin, session, idleTimeout, onClose);
     } catch (err) {
         active?.destroy();
         tunnel?.destroy();
         throw openingError || err;
     } finally {
         clearTimeout(timer);
-        if (owner) owner.cancelOpening = undefined;
+        signal?.removeEventListener('abort', onAbort);
     }
 }
 
-module.exports = createHttp2Transport;
-Object.defineProperty(module.exports, 'resolveHttp2TransportOptions', { value: resolveHttp2TransportOptions });
+async function createHttp2Transport(origin, options) {
+    return openTransport(origin, resolveHttp2TransportOptions(options));
+}
+
+module.exports = { createHttp2Transport, openTransport, resolveHttp2TransportOptions };

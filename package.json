@@ -15,13 +15,13 @@
             "require": "./index.js",
             "import": "./index.mjs"
         },
-        "./*": "./*.js"
+        "./package.json": "./package.json"
     },
     "scripts": {
         "test": "node --test test/*.test.cjs"
     },
     "engines": {
-        "node": ">=14"
+        "node": ">=20"
     },
     "keywords": [
         "agent",
@@ -32,7 +32,7 @@
         "tunnel"
     ],
     "author": "tish",
-    "license": "ISC",
+    "license": "MIT",
     "devDependencies": {
         "axios": "^1.21.1"
     }

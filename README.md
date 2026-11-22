@@ -26,26 +26,40 @@ Here `timeout` caps the wait for the proxy's CONNECT reply and closes idle keep-
 ## HTTP/2 transport
 
 Speaks HTTP/2 to the origin directly or through an HTTP/HTTPS proxy: `h2` via ALPN for HTTPS, cleartext `h2c` for HTTP.
+Receive windows match Chrome (6 MB per stream, 15 MB per connection), so large responses are not throttled on slow links.
 
-**Pool** — one shared session per origin; a closed session is replaced on the next `get()`:
-
-```javascript
-import { createHttp2TransportPool } from 'agent-hyper'
-
-const transportPool = createHttp2TransportPool({ proxy: 'http://localhost:8080' })
-const client = async config => axios({ ...config, transport: await transportPool.get(axios.getUri(config)) })
-
-await client({ url: 'https://api-a.example.org/users' })
-await client({ method: 'post', baseURL: 'https://api-b.example.net', url: '/orders', data: { quantity: 1 } })
-```
-
-**Single transport** — one session without reconnection: once `transport.accepting` is `false`, create a new one.
+**Single transport** — one session for a batch of requests that you open and close yourself.
+It does not reconnect: once `transport.accepting` is `false`, create a new one.
 
 ```javascript
 import { createHttp2Transport } from 'agent-hyper'
 
 const transport = await createHttp2Transport('https://api.example.org', { proxy: 'http://localhost:8080' })
-const client = axios.create({ baseURL: 'https://api.example.org', transport })
+try {
+    await axios.post('https://api.example.org/orders', { quantity: 1 }, { transport, proxy: false })
+} finally {
+    await transport.close()
+}
+```
+
+`proxy: false` keeps axios from applying a global proxy (`HTTP_PROXY`, `HTTPS_PROXY`) on top of the transport,
+which would fail with `HTTP/2 REQUEST ORIGIN MISMATCH`. Axios does not follow redirects when a custom `transport` is set.
+
+**Pool** — for long-lived clients, with one origin or many: one shared session per origin,
+reopened on the next `get()` after it closes.
+
+```javascript
+import { createHttp2TransportPool } from 'agent-hyper'
+
+const transportPool = createHttp2TransportPool({ proxy: 'http://localhost:8080' })
+const client = async config => axios({
+    ...config,
+    proxy: false,
+    transport: await transportPool.get(axios.getUri(config)),
+})
+
+await client({ url: 'https://api-a.example.org/users' })
+await client({ method: 'post', baseURL: 'https://api-b.example.net', url: '/orders', data: { quantity: 1 } })
 ```
 
 Both take the same options:
@@ -58,7 +72,7 @@ Both take the same options:
 | `timeout` | `5000` | Limit for the whole connection setup, ms |
 | `idleTimeout` | `10000` | Closes a session after this long with no requests in flight, ms |
 
-`0` or `Infinity` disables a timer. Idle sessions never keep the process alive.
+`0` (as in axios) or `Infinity` disables a timer. Idle sessions never keep the process alive.
 
 ### Closing
 
@@ -72,6 +86,7 @@ To stop without waiting for responses, give the pool client a shared signal and 
 const shutdown = new AbortController()
 const client = async config => axios({
     ...config,
+    proxy: false,
     signal: shutdown.signal,
     transport: await transportPool.get(axios.getUri(config)),
 })
@@ -79,12 +94,6 @@ const client = async config => axios({
 shutdown.abort()
 await transportPool.close()
 ```
-
-### With axios
-
--   If axios picks up a global proxy (`HTTP_PROXY`, `HTTPS_PROXY`), pass `proxy: false`; otherwise the transport
-    rejects the rewritten request with `HTTP/2 REQUEST ORIGIN MISMATCH`.
--   Axios does not follow redirects when a custom `transport` is set.
 
 ## License
 

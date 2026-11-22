@@ -9,6 +9,9 @@ const excludedRequestHeaders = new Set([
     'upgrade', 'proxy-authorization', 'proxy-authenticate', 'http2-settings',
 ]);
 
+const streamWindowSize = 6 * 1024 * 1024;
+const connectionWindowSize = 15 * 1024 * 1024;
+
 // Node turns timer values outside (0, 2^31) into 1 ms, so 0 (no timer) is used for them instead.
 const normalizeTimeout = (value) => (value > 0 && value < 2 ** 31 ? value : 0);
 
@@ -167,11 +170,16 @@ async function openTransport(origin, settings, { onClose, signal } = {}) {
             if (socket.alpnProtocol !== 'h2') throw new Error('HTTP/2 ALPN NEGOTIATION FAILED');
         }
 
-        const session = http2.connect(origin, socket ? { createConnection: () => socket } : undefined);
+        // Chrome's receive windows; Node's 64 KB default throttles large responses on high-latency paths.
+        const session = http2.connect(origin, {
+            settings: { initialWindowSize: streamWindowSize },
+            createConnection: socket && (() => socket),
+        });
         active = session;
         await waitFor(session, 'remoteSettings', 'HTTP/2 SESSION CLOSED BEFORE SETTINGS');
         if (openingError) throw openingError;
         if (session.closed || session.destroyed) throw new Error('HTTP/2 SESSION CLOSED DURING SETUP');
+        session.setLocalWindowSize(connectionWindowSize);
         return transportFor(origin, session, idleTimeout, onClose);
     } catch (err) {
         active?.destroy();

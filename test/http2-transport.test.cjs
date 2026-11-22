@@ -150,6 +150,18 @@ test('IPv6 origins get a bracketed :authority', async (t) => {
     }
 });
 
+test('sessions advertise Chrome-sized receive windows', async (t) => {
+    // Measured by the server before it sends any data, so both values are exact.
+    const server = await listen(http2.createServer((req, res) => {
+        const { session } = req.stream;
+        res.end(JSON.stringify([session.remoteSettings.initialWindowSize, session.state.remoteWindowSize]));
+    }));
+    const url = 'http://127.0.0.1:' + server.address().port;
+    const transport = await createHttp2Transport(url);
+    t.after(() => transport.close());
+    assert.deepEqual((await axios.get(url, { transport, proxy: false })).data, [6 * 1024 * 1024, 15 * 1024 * 1024]);
+});
+
 test('407 prevents a connection to the origin; TLS must negotiate h2', async () => {
     const start = connections;
     await assert.rejects(createHttp2Transport(originURL, {

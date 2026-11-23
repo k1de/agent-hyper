@@ -1,6 +1,7 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
+const http = require('node:http');
 const https = require('node:https');
 const http2 = require('node:http2');
 const net = require('node:net');
@@ -48,8 +49,9 @@ async function checkPosts(t, url, server) {
     const target = new URL(url);
     const count = server?.requests.length;
     const start = sessions;
-    const transport = await createHttp2Transport(url, { ...options(server), timeout: 1500 });
+    const transport = await createHttp2Transport(url, { ...options(server), connectTimeout: 1500 });
     t.after(() => transport.close());
+    assert.deepEqual([transport.connectTimeout, transport.idleTimeout], [1500, 10000]);
     for (const i of [1, 2]) {
         const path = '/echo?i=' + i;
         const response = await axios.post(url + path, { i }, { transport, proxy: false, timeout: 1500 });
@@ -103,12 +105,13 @@ test('request builds its own pseudo-headers and filters connection-specific fiel
     }
 });
 
-test('standalone and pooled transports report unsupported schemes and preserve URL parsing errors', async () => {
+test('transports report unsupported schemes, keep URL parsing errors and treat an empty proxy as direct', async () => {
     const transportPool = createHttp2TransportPool();
     for (const open of [createHttp2Transport, transportPool.get]) {
-        await assert.rejects(open('ftp://localhost'), { name: 'TypeError', message: 'HTTP/2 UNSUPPORTED ORIGIN SCHEME' });
+        await assert.rejects(open('ftp://localhost'), { name: 'TypeError', message: 'UNSUPPORTED ORIGIN SCHEME' });
         await assert.rejects(open('invalid-url'), { code: 'ERR_INVALID_URL' });
     }
+    assert.equal(resolveHttp2TransportOptions({ proxy: '' }).proxy, null);
 });
 
 test('HTTPS proxy and destination certificates are checked against their own addresses', async () => {
@@ -162,27 +165,31 @@ test('sessions advertise Chrome-sized receive windows', async (t) => {
     assert.deepEqual((await axios.get(url, { transport, proxy: false })).data, [6 * 1024 * 1024, 15 * 1024 * 1024]);
 });
 
-test('407 prevents a connection to the origin; TLS must negotiate h2', async () => {
+test('407 prevents a connection to the origin; HTTP/1-only servers are reported as such', async () => {
     const start = connections;
     await assert.rejects(createHttp2Transport(originURL, {
         ...options(tcpProxy), proxyRequestOptions: { headers: { 'x-deny': '1' } },
     }), { message: 'PROXY HTTP 407' });
     assert.equal(connections - start, 0);
-    const server = await listen(https.createServer({ ...ipCert, ALPNProtocols: [] }));
-    await assert.rejects(createHttp2Transport('https://127.0.0.1:' + server.address().port,
-        { originTls: { ca: ipCert.cert } }), { message: 'HTTP/2 ALPN NEGOTIATION FAILED' });
+    // HTTPS refuses h2 in ALPN; cleartext h2c gets an HTTP/1 reply, kept as the cause.
+    const tlsServer = await listen(https.createServer({ ...ipCert, ALPNProtocols: [] }));
+    await assert.rejects(createHttp2Transport('https://127.0.0.1:' + tlsServer.address().port,
+        { originTls: { ca: ipCert.cert } }), { message: 'HTTP/2 NOT SUPPORTED BY SERVER' });
+    const cleartextServer = await listen(http.createServer((_, res) => res.end()));
+    await assert.rejects(createHttp2Transport('http://127.0.0.1:' + cleartextServer.address().port),
+        (err) => err.message === 'HTTP/2 NOT SUPPORTED BY SERVER' && err.cause.code === 'ERR_HTTP2_ERROR');
 });
 
 test('h2c sends CONNECT to port 80 when the origin omits the port', async () => {
     const count = tcpProxy.requests.length;
     await assert.rejects(createHttp2Transport('http://localhost', {
-        proxy: tcpProxy.url, proxyRequestOptions: { headers: { 'x-deny': '1' } }, timeout: 1500,
+        proxy: tcpProxy.url, proxyRequestOptions: { headers: { 'x-deny': '1' } }, connectTimeout: 1500,
     }), { message: 'PROXY HTTP 407' });
     assert.equal(tcpProxy.requests.length, count + 1);
     assert.equal(tcpProxy.requests[count].target, 'localhost:80');
 });
 
-test('opening timeout closes the peer socket during CONNECT, TLS and SETTINGS', { timeout: 5000 }, async () => {
+test('connectTimeout closes the peer socket during CONNECT, TLS and the HTTP/2 handshake', { timeout: 5000 }, async () => {
     const tlsStall = await listen(net.createServer((peer) => peer.resume()));
     const settingsStall = await listen(tls.createServer({ ...ipCert, ALPNProtocols: ['h2'] }, (peer) => peer.resume()));
     for (const [server, scheme] of [[tcpProxy, 'https'], [tlsStall, 'https'], [settingsStall, 'https'], [tlsStall, 'http']]) {
@@ -190,29 +197,30 @@ test('opening timeout closes the peer socket during CONNECT, TLS and SETTINGS', 
         const target = server === tcpProxy ? originURL : scheme + '://127.0.0.1:' + server.address().port;
         await assert.rejects(createHttp2Transport(target, {
             proxy: server === tcpProxy ? tcpProxy.url : undefined, proxyRequestOptions: { headers: { 'x-stall': '1' } },
-            originTls: { ca: ipCert.cert }, timeout: 100,
-        }), { message: 'HTTP/2 SETUP TIMEOUT' });
+            originTls: { ca: ipCert.cert }, connectTimeout: 100,
+        }), { message: server === tcpProxy ? 'PROXY TIMEOUT' : 'CONNECTION TIMEOUT' });
         await received;
     }
 });
 
-test('a clean close before SETTINGS reports the interrupted setup stage', async () => {
+test('a clean close during the HTTP/2 handshake is reported as such', async () => {
     const server = await listen(net.createServer((peer) => peer.once('data', () => peer.end())));
     await assert.rejects(createHttp2Transport('http://127.0.0.1:' + server.address().port), {
-        message: 'HTTP/2 SESSION CLOSED BEFORE SETTINGS',
+        message: 'CONNECTION CLOSED', stage: 'http2-handshake',
     });
 });
 
 test('opening timeout defaults to five seconds; zero or Infinity disables it', { timeout: 3000 }, async () => {
-    for (const options of [undefined, { timeout: undefined }]) assert.equal(resolveHttp2TransportOptions(options).timeout, 5000);
-    for (const timeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ timeout }).timeout, 0);
+    for (const options of [undefined, { connectTimeout: undefined }]) assert.equal(resolveHttp2TransportOptions(options).connectTimeout, 5000);
+    assert.equal(createHttp2TransportPool().connectTimeout, 5000);
+    for (const connectTimeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ connectTimeout }).connectTimeout, 0);
     const server = await proxy([origin]);
     server.on('connect', (_, peer) => {
         peer.setTimeout(300, () => peer.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'));
     });
     // Without normalization Node would turn Infinity into a 1 ms timer.
     await assert.rejects(createHttp2Transport(originURL, {
-        proxy: server.url, proxyRequestOptions: { headers: { 'x-stall': '1' } }, timeout: Infinity,
+        proxy: server.url, proxyRequestOptions: { headers: { 'x-stall': '1' } }, connectTimeout: Infinity,
     }), { message: 'PROXY HTTP 407' });
 });
 
@@ -223,7 +231,7 @@ test('a bound transport rejects other origins; timeout and cancellation leave th
     const start = connections;
     const beforeRequests = streams;
     for (const url of [originURL.replace('localhost', '127.0.0.1'), 'https://localhost', originURL.replace('https:', 'http:')]) {
-        await assert.rejects(axios.get(url, config), { message: 'HTTP/2 REQUEST ORIGIN MISMATCH' });
+        await assert.rejects(axios.get(url, config), { name: 'TypeError', message: 'REQUEST ORIGIN MISMATCH' });
     }
     assert.equal(connections, start);
     assert.equal(streams, beforeRequests);
@@ -245,7 +253,7 @@ test('a reset before response headers rejects the Axios request and preserves th
     const config = { transport, proxy: false, timeout: 10000 };
     origin.once('stream', (stream) => stream.close(http2.constants.NGHTTP2_CANCEL));
     await assert.rejects(axios.get(originURL + '/hold', config), (err) =>
-        axios.isAxiosError(err) && !err.response && err.message === 'HTTP/2 STREAM CLOSED BEFORE RESPONSE HEADERS');
+        axios.isAxiosError(err) && !err.response && err.message === 'REQUEST CLOSED' && err.cause.stage === 'awaiting-response');
     assert.equal((await axios.get(originURL, config)).status, 201);
     assert.equal(sessions - start, 1);
 });
@@ -270,7 +278,7 @@ test('a failed session stops accepting requests and can be closed', async () => 
     await once(session, 'close');
     for (let i = 0; transport.accepting && i < 100; i++) await new Promise((r) => setTimeout(r, 5));
     assert.equal(transport.accepting, false);
-    assert.throws(() => transport.request({}), { message: 'HTTP/2 TRANSPORT CLOSED' });
+    assert.throws(() => transport.request({}), { message: 'TRANSPORT CLOSED' });
     await transport.close();
 });
 
@@ -279,11 +287,11 @@ test('an Axios instance reports a closed transport even though it holds a copy',
     const client = axios.create({ baseURL: originURL, transport, proxy: false });
     assert.equal((await client.get('/')).status, 201);
     await transport.close();
-    await assert.rejects(client.get('/'), { message: 'HTTP/2 TRANSPORT CLOSED' });
+    await assert.rejects(client.get('/'), { message: 'TRANSPORT CLOSED' });
 });
 
 test('a pool shares concurrent opens by HTTPS origin and serves different domains', async (t) => {
-    const other = await listen(http2.createSecureServer(ipCert, (req, res) => res.end('other origin')));
+    const other = await listen(http2.createSecureServer(ipCert, (_, res) => res.end('other origin')));
     const otherURL = 'https://127.0.0.1:' + other.address().port;
     const transportPool = createHttp2TransportPool({ originTls: { ca: [dnsCert.cert, ipCert.cert] } });
     t.after(() => transportPool.close());
@@ -324,10 +332,10 @@ test('pool options are copied at creation and failed opens are not cached', asyn
 test('pool close cancels ongoing CONNECT and immediately allows new gets for the same origin', { timeout: 3000 }, async (t) => {
     const server = await proxy([origin]);
     server.stallNext = true;
-    const transportPool = createHttp2TransportPool({ ...options(server), timeout: 0 });
+    const transportPool = createHttp2TransportPool({ ...options(server), connectTimeout: 0 });
     t.after(() => transportPool.close());
     const connected = once(server, 'connect');
-    const rejected = [1, 2].map(() => assert.rejects(transportPool.get(originURL), { message: 'HTTP/2 SETUP CANCELLED BY POOL' }));
+    const rejected = [1, 2].map(() => assert.rejects(transportPool.get(originURL), { message: 'POOL CLOSED' }));
     const [, client] = await connected;
     const socketClosed = once(client, 'close');
     const drained = transportPool.close();
@@ -367,6 +375,7 @@ test('pool close drains active streams while a new session serves the same origi
 
 test('idle sessions close after idleTimeout (ten seconds by default) and stay open with zero', { timeout: 3000 }, async (t) => {
     for (const options of [undefined, { idleTimeout: undefined }]) assert.equal(resolveHttp2TransportOptions(options).idleTimeout, 10000);
+    assert.equal(createHttp2TransportPool().idleTimeout, 10000);
     for (const idleTimeout of [0, Infinity]) assert.equal(resolveHttp2TransportOptions({ idleTimeout }).idleTimeout, 0);
     const idle = { ...options(), idleTimeout: 50 };
     const transportPool = createHttp2TransportPool(idle);
@@ -377,6 +386,7 @@ test('idle sessions close after idleTimeout (ten seconds by default) and stay op
     const closed = once(origin, 'session').then(([peer]) => once(peer, 'close'));
     const pooled = await transportPool.get(originURL);
     await closed;
+    for (const owner of [standalone, pooled, transportPool]) assert.equal(owner.idleTimeout, 50);
     assert.equal(standalone.accepting, false);
     assert.equal(pooled.accepting, false);
     assert.equal(persistent.accepting, true);
@@ -417,7 +427,7 @@ test('GOAWAY drains the accepted stream and close is idempotent', { timeout: 400
         stream.session.goaway(0, stream.id);
         for (let i = 0; transport.accepting && i < 100; i++) await new Promise((r) => setTimeout(r, 5));
         assert.equal(transport.accepting, false);
-        assert.throws(() => transport.request({ path: '/' }), { message: 'HTTP/2 TRANSPORT CLOSED' });
+        assert.throws(() => transport.request({ path: '/' }), { message: 'TRANSPORT CLOSED' });
         const closed = transport.close();
         assert.equal(transport.close(), closed);
         const successor = await transportPool.get(originURL);

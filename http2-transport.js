@@ -10,7 +10,7 @@ const excludedRequestHeaders = new Set([
 ]);
 
 const http2TransportDefaults = {
-    timeout: 5000,
+    connectTimeout: 5000,
     idleTimeout: 10000,
 };
 
@@ -20,8 +20,9 @@ const connectionWindowSize = 15 * 1024 * 1024;
 // Shallow copies keep the options fixed when the caller later reuses its objects.
 function resolveHttp2TransportOptions(options = {}) {
     return {
-        proxy: options.proxy == null ? null : new URL(options.proxy),
-        timeout: normalizeTimeout(options.timeout ?? http2TransportDefaults.timeout),
+        // An empty proxy string, e.g. from an unset environment variable, means a direct connection.
+        proxy: options.proxy ? new URL(options.proxy) : null,
+        connectTimeout: normalizeTimeout(options.connectTimeout ?? http2TransportDefaults.connectTimeout),
         idleTimeout: normalizeTimeout(options.idleTimeout ?? http2TransportDefaults.idleTimeout),
         proxyRequestOptions: { ...options.proxyRequestOptions, headers: { ...options.proxyRequestOptions?.headers } },
         originTls: { ...options.originTls },
@@ -34,7 +35,7 @@ function requestHeaders(origin, options) {
     const port = options.port ?? (name ? '' : origin.port);
     const protocol = options.protocol || origin.protocol;
     const target = new URL(`${protocol}//${host}${port ? ':' + port : ''}`);
-    if (target.origin !== origin.origin) throw new Error('HTTP/2 REQUEST ORIGIN MISMATCH');
+    if (target.origin !== origin.origin) throw new TypeError('REQUEST ORIGIN MISMATCH');
 
     const headers = {
         __proto__: null,
@@ -52,7 +53,8 @@ function requestHeaders(origin, options) {
     }
     for (const [name, value] of fields) {
         const key = name.toLowerCase();
-        if (value == null || key.startsWith(':') || excludedRequestHeaders.has(key) || connectionFields.has(key)) continue;
+        if (value === undefined || value === null) continue;
+        if (key.startsWith(':') || excludedRequestHeaders.has(key) || connectionFields.has(key)) continue;
         if (key === 'te' && String(value).toLowerCase() !== 'trailers') continue;
         headers[key] = value;
     }
@@ -60,7 +62,7 @@ function requestHeaders(origin, options) {
     return headers;
 }
 
-function transportFor(origin, session, idleTimeout, onClose) {
+function transportFor(origin, session, { connectTimeout, idleTimeout }, onClose) {
     let accepting = true;
     let streams = 0;
     let idleTimer;
@@ -93,9 +95,11 @@ function transportFor(origin, session, idleTimeout, onClose) {
     idle();
 
     return {
+        connectTimeout,
+        idleTimeout,
         get accepting() { return isAccepting(); },
         request(options, callback) {
-            if (!isAccepting()) throw new Error('HTTP/2 TRANSPORT CLOSED');
+            if (!isAccepting()) throw new Error('TRANSPORT CLOSED');
             const stream = session.request(requestHeaders(origin, options), { endStream: false });
             clearTimeout(idleTimer);
             session.ref();
@@ -104,7 +108,9 @@ function transportFor(origin, session, idleTimeout, onClose) {
                 streams--;
                 idle();
             });
-            const onPrematureClose = () => stream.emit('error', new Error('HTTP/2 STREAM CLOSED BEFORE RESPONSE HEADERS'));
+            const onPrematureClose = () => {
+                stream.emit('error', Object.assign(new Error('REQUEST CLOSED'), { stage: 'awaiting-response' }));
+            };
             stream.once('close', onPrematureClose);
             stream.once(errorMonitor, () => stream.off('close', onPrematureClose));
             stream.once('response', ({ ':status': status, ...headers }) => {
@@ -120,10 +126,10 @@ function transportFor(origin, session, idleTimeout, onClose) {
     };
 }
 
-// A peer can close cleanly before the TLS handshake or the first SETTINGS frame.
-async function waitFor(resource, event, closedMessage) {
+// A peer can close the connection without an error before a handshake completes; `stage` says which one.
+async function waitFor(resource, event, stage) {
     let ready, fail;
-    const closed = () => fail(new Error(closedMessage));
+    const closed = () => fail(Object.assign(new Error('CONNECTION CLOSED'), { stage }));
     try {
         await new Promise((resolve, reject) => {
             ready = resolve;
@@ -139,8 +145,8 @@ async function waitFor(resource, event, closedMessage) {
 async function openTransport(origin, settings, { onClose, signal } = {}) {
     origin = new URL(origin);
     const secure = origin.protocol === 'https:';
-    if (!secure && origin.protocol !== 'http:') throw new TypeError('HTTP/2 UNSUPPORTED ORIGIN SCHEME');
-    const { proxy, originTls, proxyRequestOptions, timeout, idleTimeout } = settings;
+    if (!secure && origin.protocol !== 'http:') throw new TypeError('UNSUPPORTED ORIGIN SCHEME');
+    const { proxy, originTls, proxyRequestOptions, connectTimeout } = settings;
     const host = origin.hostname.replace(/^\[|\]$/g, '');
     const port = Number(origin.port || (secure ? 443 : 80));
     let active, tunnel, openingError;
@@ -150,7 +156,10 @@ async function openTransport(origin, settings, { onClose, signal } = {}) {
     }
     const onAbort = () => cancel(signal.reason);
     signal?.addEventListener('abort', onAbort);
-    const timer = timeout && setTimeout(() => cancel(new Error('HTTP/2 SETUP TIMEOUT')), timeout);
+    // While the proxy has not answered CONNECT, the proxy is the one that timed out, as with the agents.
+    const timer = connectTimeout && setTimeout(() => {
+        cancel(new Error(proxy && !tunnel ? 'PROXY TIMEOUT' : 'CONNECTION TIMEOUT'));
+    }, connectTimeout);
     try {
         if (proxy) {
             tunnel = await new Promise((resolve, reject) => {
@@ -167,9 +176,9 @@ async function openTransport(origin, settings, { onClose, signal } = {}) {
                 ALPNProtocols: ['h2'],
             });
             active = socket;
-            await waitFor(socket, 'secureConnect', 'HTTP/2 CONNECTION CLOSED DURING TLS HANDSHAKE');
+            await waitFor(socket, 'secureConnect', 'tls-handshake');
             if (openingError) throw openingError;
-            if (socket.alpnProtocol !== 'h2') throw new Error('HTTP/2 ALPN NEGOTIATION FAILED');
+            if (socket.alpnProtocol !== 'h2') throw new Error('HTTP/2 NOT SUPPORTED BY SERVER');
         }
 
         // Chrome's receive windows; Node's 64 KB default throttles large responses on high-latency paths.
@@ -178,11 +187,18 @@ async function openTransport(origin, settings, { onClose, signal } = {}) {
             createConnection: socket && (() => socket),
         });
         active = session;
-        await waitFor(session, 'remoteSettings', 'HTTP/2 SESSION CLOSED BEFORE SETTINGS');
+        await waitFor(session, 'remoteSettings', 'http2-handshake').catch((err) => {
+            // Over cleartext, a server without HTTP/2 answers the connection preface with bytes that fail as a protocol
+            // error; over TLS, ALPN has already confirmed HTTP/2, so a protocol error there means a faulty server.
+            if (!secure && err.code === 'ERR_HTTP2_ERROR') throw new Error('HTTP/2 NOT SUPPORTED BY SERVER', { cause: err });
+            throw err;
+        });
         if (openingError) throw openingError;
-        if (session.closed || session.destroyed) throw new Error('HTTP/2 SESSION CLOSED DURING SETUP');
+        if (session.closed || session.destroyed) {
+            throw Object.assign(new Error('CONNECTION CLOSED'), { stage: 'http2-handshake' });
+        }
         session.setLocalWindowSize(connectionWindowSize);
-        return transportFor(origin, session, idleTimeout, onClose);
+        return transportFor(origin, session, settings, onClose);
     } catch (err) {
         active?.destroy();
         tunnel?.destroy();

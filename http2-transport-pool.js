@@ -6,9 +6,12 @@ function createHttp2TransportPool(options) {
     let closing = Promise.resolve();
 
     return {
+        connectTimeout: settings.connectTimeout,
+        idleTimeout: settings.idleTimeout,
+
         async get(url) {
             const target = new URL(url);
-            if (target.protocol !== 'https:' && target.protocol !== 'http:') throw new TypeError('HTTP/2 UNSUPPORTED ORIGIN SCHEME');
+            if (target.protocol !== 'https:' && target.protocol !== 'http:') throw new TypeError('UNSUPPORTED ORIGIN SCHEME');
             const key = target.origin;
             const cached = byOrigin.get(key);
             if (cached && (!cached.transport || cached.transport.accepting)) return cached.opening;
@@ -31,8 +34,9 @@ function createHttp2TransportPool(options) {
             const entries = Array.from(byOrigin.values());
             byOrigin.clear();
             const current = Promise.all(entries.map((entry) => {
-                entry.controller.abort(new Error('HTTP/2 SETUP CANCELLED BY POOL'));
-                return entry.transport ? entry.transport.close() : entry.opening.then((transport) => transport.close(), () => {});
+                entry.controller.abort(new Error('POOL CLOSED'));
+                if (entry.transport) return entry.transport.close();
+                return entry.opening.then((transport) => transport.close(), () => {});
             }));
             // Each call also waits for earlier calls that are still draining.
             closing = Promise.all([closing, current]).then(() => {});

@@ -3,7 +3,7 @@
 > Based on [hpagent](https://github.com/delvedor/hpagent) by Tomas Della Vedova.
 > Forked for personal needs — for most use cases, prefer the [original package](https://github.com/delvedor/hpagent).
 
-HTTP/HTTPS proxy agents and an HTTP/2 client transport for Node.js 20+.
+HTTP/HTTPS agents with an optional proxy and an HTTP/2 client transport for Node.js 20+.
 
 ```bash
 npm install agent-hyper
@@ -12,14 +12,17 @@ npm install agent-hyper
 > **Disclaimer:** always pass `proxy: false` to axios. Otherwise axios may apply a global proxy from `HTTP_PROXY` /
 > `HTTPS_PROXY` on top of the agent or transport, and requests may not go through them as configured.
 
-## Proxy agents
+## Agents
+
+`HttpAgent` / `HttpsAgent` connect directly, or through a proxy when `proxy` is set.
+`HttpProxyAgent` / `HttpsProxyAgent` are the same but require a proxy.
 
 ```javascript
 import axios from 'axios'
-import { HttpsProxyAgent } from 'agent-hyper' // HttpProxyAgent for http:// targets
+import { HttpsAgent } from 'agent-hyper' // HttpAgent for http:// targets
 
 const client = axios.create({
-    httpsAgent: new HttpsProxyAgent({ proxy: 'http://user:pass@localhost:8080' }),
+    httpsAgent: new HttpsAgent({ proxy: config.proxy }), // direct when config.proxy is not set
     proxy: false,
 })
 await client.get('https://api.example.org/users')
@@ -27,9 +30,9 @@ await client.get('https://api.example.org/users')
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `proxy` | Proxy URL; credentials go in it (`http://user:pass@host:port`) | required |
+| `proxy` | Proxy URL with credentials (`http://user:pass@host:port`); omit or leave empty for a direct connection | — |
 | `proxyRequestOptions` | `headers`, `ca`, `cert`, `key`, `rejectUnauthorized` for the CONNECT request | — |
-| `timeout` | Limit for connecting to the proxy and its CONNECT reply (not covered by axios `timeout` by default), ms | `5000` |
+| `connectTimeout` | Limit for establishing a connection, ms | `5000` |
 | `idleTimeout` | Closes a keep-alive socket after this long without requests, ms | `10000` |
 | `keepAlive` | Reuses sockets between requests | `true` |
 | `keepAliveMsecs` | Delay before TCP keep-alive probes on an idle socket, ms | `1000` |
@@ -89,10 +92,10 @@ Both take the same options:
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `proxy` | Proxy URL; omit for a direct connection | — |
+| `proxy` | Proxy URL; omit or leave empty for a direct connection | — |
 | `proxyRequestOptions` | Same as for the agents | — |
 | `originTls` | `ca`, `cert`, `key`, `rejectUnauthorized` for the origin | — |
-| `timeout` | Limit for the whole connection setup, ms | `5000` |
+| `connectTimeout` | Limit for establishing a connection, ms | `5000` |
 | `idleTimeout` | Closes a session after this long with no requests in flight, ms | `10000` |
 
 `0` (as in axios) or `Infinity` disables a timer. Idle sessions never keep the process alive.

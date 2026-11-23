@@ -29,13 +29,16 @@ function resolveHttp2TransportOptions(options = {}) {
     };
 }
 
-function requestHeaders(origin, options) {
+// The origin a request targets; a transport's own origin fills in what the options leave out.
+function requestOrigin(options, origin = {}) {
     const name = options.hostname || options.host;
-    const host = isIPv6(name) ? `[${name}]` : name || origin.hostname;
+    const host = isIPv6(name) ? `[${name}]` : name || origin.hostname || '';
     const port = options.port ?? (name ? '' : origin.port);
-    const protocol = options.protocol || origin.protocol;
-    const target = new URL(`${protocol}//${host}${port ? ':' + port : ''}`);
-    if (target.origin !== origin.origin) throw new TypeError('REQUEST ORIGIN MISMATCH');
+    return new URL(`${options.protocol || origin.protocol}//${host}${port ? ':' + port : ''}`);
+}
+
+function requestHeaders(origin, options) {
+    if (requestOrigin(options, origin).origin !== origin.origin) throw new TypeError('REQUEST ORIGIN MISMATCH');
 
     const headers = {
         __proto__: null,
@@ -62,68 +65,86 @@ function requestHeaders(origin, options) {
     return headers;
 }
 
-function transportFor(origin, session, { connectTimeout, idleTimeout }, onClose) {
-    let accepting = true;
-    let streams = 0;
-    let idleTimer;
-    // Axios clones plain-object transports, so `this.accepting` could be a stale copy.
-    const isAccepting = () => accepting && !session.closed && !session.destroyed;
-    const stop = () => {
-        accepting = false;
-        clearTimeout(idleTimer);
-    };
-    session.once('goaway', stop);
-    session.on('error', stop);
-    const closed = new Promise((resolve) => session.once('close', () => {
-        stop();
-        onClose?.();
-        resolve();
-    }));
+// Node's close() is graceful: it first sends the rest of the body, so a request axios cancels this way would still
+// reach the server whole. destroy() resets the stream at once, as the pool's stand-in does.
+function resetStream(_code, callback) {
+    if (callback) this.once('close', callback);
+    this.destroy();
+}
 
-    function close() {
-        stop();
-        if (!session.destroyed) session.ref();
-        session.close();
-        return closed;
+// A class instance, unlike a plain object, is not copied by axios for every request.
+class Http2Transport {
+    #origin;
+    #session;
+    #closed;
+    #accepting = true;
+    #streams = 0;
+    #idleTimer = null;
+
+    constructor(origin, session, { connectTimeout, idleTimeout }, onClose) {
+        this.connectTimeout = connectTimeout;
+        this.idleTimeout = idleTimeout;
+        this.#origin = origin;
+        this.#session = session;
+        // Methods keep working when passed on detached, e.g. `t.after(transport.close)`.
+        for (const name of ['request', 'close']) this[name] = this[name].bind(this);
+        // GOAWAY closes or destroys the session by itself, which `accepting` checks; unhandled errors would throw.
+        session.on('error', () => this.#stop());
+        this.#closed = new Promise((resolve) => session.once('close', () => {
+            this.#stop();
+            onClose?.();
+            resolve();
+        }));
+        this.#idle();
     }
 
-    function idle() {
-        if (!accepting || streams) return;
-        session.unref();
-        if (idleTimeout) idleTimer = setTimeout(close, idleTimeout).unref();
+    get accepting() {
+        return this.#accepting && !this.#session.closed && !this.#session.destroyed;
     }
-    idle();
 
-    return {
-        connectTimeout,
-        idleTimeout,
-        get accepting() { return isAccepting(); },
-        request(options, callback) {
-            if (!isAccepting()) throw new Error('TRANSPORT CLOSED');
-            const stream = session.request(requestHeaders(origin, options), { endStream: false });
-            clearTimeout(idleTimer);
-            session.ref();
-            streams++;
-            stream.once('close', () => {
-                streams--;
-                idle();
-            });
-            const onPrematureClose = () => {
-                stream.emit('error', Object.assign(new Error('REQUEST CLOSED'), { stage: 'awaiting-response' }));
-            };
-            stream.once('close', onPrematureClose);
-            stream.once(errorMonitor, () => stream.off('close', onPrematureClose));
-            stream.once('response', ({ ':status': status, ...headers }) => {
-                stream.off('close', onPrematureClose);
-                stream.statusCode = status;
-                stream.statusMessage = '';
-                stream.headers = headers;
-                if (callback) callback(stream);
-            });
-            return stream;
-        },
-        close,
-    };
+    request(options, callback) {
+        if (!this.accepting) throw new Error('TRANSPORT CLOSED');
+        const stream = this.#session.request(requestHeaders(this.#origin, options), { endStream: false });
+        stream.close = resetStream;
+        clearTimeout(this.#idleTimer);
+        this.#session.ref();
+        this.#streams++;
+        stream.once('close', () => {
+            this.#streams--;
+            this.#idle();
+        });
+        const onPrematureClose = () => {
+            stream.emit('error', Object.assign(new Error('REQUEST CLOSED'), { stage: 'awaiting-response' }));
+        };
+        stream.once('close', onPrematureClose);
+        stream.once(errorMonitor, () => stream.off('close', onPrematureClose));
+        stream.once('response', ({ ':status': status, ...headers }) => {
+            stream.off('close', onPrematureClose);
+            stream.statusCode = status;
+            stream.statusMessage = '';
+            stream.headers = headers;
+            if (callback) callback(stream);
+        });
+        return stream;
+    }
+
+    close() {
+        this.#stop();
+        if (!this.#session.destroyed) this.#session.ref();
+        this.#session.close();
+        return this.#closed;
+    }
+
+    #stop() {
+        this.#accepting = false;
+        clearTimeout(this.#idleTimer);
+    }
+
+    #idle() {
+        if (!this.#accepting || this.#streams) return;
+        this.#session.unref();
+        if (this.idleTimeout) this.#idleTimer = setTimeout(this.close, this.idleTimeout).unref();
+    }
 }
 
 // A peer can close the connection without an error before a handshake completes; `stage` says which one.
@@ -198,7 +219,7 @@ async function openTransport(origin, settings, { onClose, signal } = {}) {
             throw Object.assign(new Error('CONNECTION CLOSED'), { stage: 'http2-handshake' });
         }
         session.setLocalWindowSize(connectionWindowSize);
-        return transportFor(origin, session, settings, onClose);
+        return new Http2Transport(origin, session, settings, onClose);
     } catch (err) {
         active?.destroy();
         tunnel?.destroy();
@@ -213,4 +234,4 @@ async function createHttp2Transport(origin, options) {
     return openTransport(origin, resolveHttp2TransportOptions(options));
 }
 
-module.exports = { createHttp2Transport, openTransport, resolveHttp2TransportOptions };
+module.exports = { createHttp2Transport, openTransport, requestOrigin, resolveHttp2TransportOptions };

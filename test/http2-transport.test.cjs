@@ -5,6 +5,7 @@ const http = require('node:http');
 const https = require('node:https');
 const http2 = require('node:http2');
 const net = require('node:net');
+const { Readable } = require('node:stream');
 const tls = require('node:tls');
 const axios = require('axios');
 const { createHttp2Transport, createHttp2TransportPool } = require('agent-hyper');
@@ -111,6 +112,7 @@ test('transports report unsupported schemes, keep URL parsing errors and treat a
         await assert.rejects(open('ftp://localhost'), { name: 'TypeError', message: 'UNSUPPORTED ORIGIN SCHEME' });
         await assert.rejects(open('invalid-url'), { code: 'ERR_INVALID_URL' });
     }
+    assert.throws(() => transportPool.request({ protocol: 'ftp:', hostname: 'localhost' }), { message: 'UNSUPPORTED ORIGIN SCHEME' });
     assert.equal(resolveHttp2TransportOptions({ proxy: '' }).proxy, null);
 });
 
@@ -148,7 +150,7 @@ test('IPv6 origins get a bracketed :authority', async (t) => {
     const standalone = await createHttp2Transport(url);
     const transportPool = createHttp2TransportPool();
     t.after(() => Promise.all([standalone.close(), transportPool.close()]));
-    for (const transport of [standalone, await transportPool.get(url)]) {
+    for (const transport of [standalone, transportPool]) {
         assert.equal((await axios.get(url + '/', { transport, proxy: false })).data, new URL(url).host);
     }
 });
@@ -224,7 +226,7 @@ test('opening timeout defaults to five seconds; zero or Infinity disables it', {
     }), { message: 'PROXY HTTP 407' });
 });
 
-test('a bound transport rejects other origins; timeout and cancellation leave the session usable', async (t) => {
+test('a bound transport rejects other origins; timeout and cancellation reset the stream and leave the session usable', { timeout: 3000 }, async (t) => {
     const transport = await createHttp2Transport(originURL, options());
     t.after(() => transport.close());
     const config = { transport, proxy: false };
@@ -238,10 +240,12 @@ test('a bound transport rejects other origins; timeout and cancellation leave th
     await assert.rejects(axios.get(originURL + '/hold', { ...config, timeout: 60 }), { code: 'ECONNABORTED' });
     const controller = new AbortController();
     const arrived = once(origin, 'stream');
-    const aborted = axios.get(originURL + '/hold', { ...config, signal: controller.signal });
-    await arrived;
+    // /hold never reads this body, so a graceful close would wait for it forever instead of resetting the stream.
+    const aborted = axios.post(originURL + '/hold', Buffer.alloc(1024 * 1024), { ...config, signal: controller.signal });
+    const [held] = await arrived;
     controller.abort();
     await assert.rejects(aborted, { code: 'ERR_CANCELED' });
+    await once(held, 'close');
     assert.equal((await axios.get(originURL, config)).status, 201);
     assert.equal(connections, start);
 });
@@ -258,56 +262,82 @@ test('a reset before response headers rejects the Axios request and preserves th
     assert.equal(sessions - start, 1);
 });
 
-test('Axios receives the native HTTP/2 error code when a stream is refused', async (t) => {
+test('Axios receives the native HTTP/2 error code when a stream is refused', { timeout: 3000 }, async (t) => {
     const transport = await createHttp2Transport(originURL, options());
-    t.after(() => transport.close());
-    origin.once('stream', (stream) => {
-        stream.once('error', () => {});
-        stream.close(http2.constants.NGHTTP2_REFUSED_STREAM);
-    });
-    await assert.rejects(axios.get(originURL + '/hold', { transport, proxy: false, timeout: 1500 }), {
-        code: 'ERR_HTTP2_STREAM_ERROR',
-    });
+    // A fresh pool sends its first request through the stand-in.
+    const transportPool = createHttp2TransportPool(options());
+    t.after(() => Promise.all([transport.close(), transportPool.close()]));
+    for (const via of [transport, transportPool]) {
+        origin.once('stream', (stream) => {
+            stream.once('error', () => {});
+            stream.close(http2.constants.NGHTTP2_REFUSED_STREAM);
+        });
+        await assert.rejects(axios.get(originURL + '/hold', { transport: via, proxy: false, timeout: 1500 }), {
+            code: 'ERR_HTTP2_STREAM_ERROR',
+        });
+    }
 });
 
 test('a failed session stops accepting requests and can be closed', async () => {
     const connected = once(origin, 'session');
     const transport = await createHttp2Transport(originURL, options());
     const [session] = await connected;
-    session.destroy(undefined, http2.constants.NGHTTP2_INTERNAL_ERROR);
-    await once(session, 'close');
+    // Node fails the client session with an 'error' event, which must not crash the process.
+    session.goaway(http2.constants.NGHTTP2_INTERNAL_ERROR);
     for (let i = 0; transport.accepting && i < 100; i++) await new Promise((r) => setTimeout(r, 5));
     assert.equal(transport.accepting, false);
     assert.throws(() => transport.request({}), { message: 'TRANSPORT CLOSED' });
     await transport.close();
 });
 
-test('an Axios instance reports a closed transport even though it holds a copy', async () => {
+test('an Axios instance keeps the transport itself and reports it closed', async () => {
     const transport = await createHttp2Transport(originURL, options());
     const client = axios.create({ baseURL: originURL, transport, proxy: false });
+    assert.equal(client.defaults.transport, transport);
     assert.equal((await client.get('/')).status, 201);
     await transport.close();
     await assert.rejects(client.get('/'), { message: 'TRANSPORT CLOSED' });
 });
 
-test('a pool shares concurrent opens by HTTPS origin and serves different domains', async (t) => {
-    const other = await listen(http2.createSecureServer(ipCert, (_, res) => res.end('other origin')));
-    const otherURL = 'https://127.0.0.1:' + other.address().port;
-    const transportPool = createHttp2TransportPool({ originTls: { ca: [dnsCert.cert, ipCert.cert] } });
-    t.after(() => transportPool.close());
-    const start = sessions;
-    const [first, second] = await Promise.all([
-        transportPool.get(originURL + '/one'), transportPool.get(new URL(originURL + '/two')),
+test('a pool serves Axios requests while sessions open and never sends the ones closed meanwhile', { timeout: 3000 }, async (t) => {
+    // The proxy answers CONNECT after 200 ms, so every request below starts before its session is open.
+    const transportPool = createHttp2TransportPool({ ...options(tcpProxy), proxyRequestOptions: { headers: { 'x-delay': '200' } } });
+    t.after(transportPool.close);
+    const client = axios.create({ transport: transportPool, proxy: false });
+    const [startSessions, startStreams] = [sessions, streams];
+    const body = Buffer.alloc(1024 * 1024, 'a');
+    const controller = new AbortController();
+    // A timeout that fires after the session opened cancels the stream on the server too.
+    const held = new Promise((resolve) => origin.on('stream', function onStream(stream, headers) {
+        if (headers[':path'] !== '/hold') return;
+        origin.off('stream', onStream);
+        resolve(once(stream, 'close'));
+    }));
+    const closed = [
+        assert.rejects(client.post(originURL + '/timed-out', 'x', { timeout: 50 }), { code: 'ECONNABORTED' }),
+        assert.rejects(client.post(originURL + '/aborted', 'x', { signal: controller.signal }), { code: 'ERR_CANCELED' }),
+        assert.rejects(client.get(originURL + '/hold', { timeout: 300 }), { code: 'ECONNABORTED' }),
+        held,
+    ];
+    controller.abort();
+    const [posted, streamed, other] = await Promise.all([
+        client.post(originURL + '/echo', 'body', { params: { q: 1 } }),
+        client.post(originURL + '/stream', Readable.from([body.subarray(0, body.length / 2), body.subarray(body.length / 2)])),
+        client.get(cleartextURL + '/other'),
+        ...closed,
     ]);
-    assert.equal(first, second);
-    const alternate = await transportPool.get(otherURL);
-    assert.notEqual(alternate, first);
-    assert.equal(await transportPool.get(originURL), first);
-    const client = async config => axios({ ...config, transport: await transportPool.get(axios.getUri(config)) });
-    assert.equal((await client({ method: 'get', url: otherURL })).data, 'other origin');
-    const { data } = await client({ method: 'post', baseURL: originURL, url: '/echo', params: { q: 1 }, data: 'body' });
-    assert.deepEqual([data.method, data.path, data.body], ['POST', '/echo?q=1', 'body']);
-    assert.equal(sessions - start, 1);
+    assert.deepEqual([posted.data.method, posted.data.path, posted.data.body], ['POST', '/echo?q=1', 'body']);
+    assert.equal(streamed.data.body, body.toString());
+    assert.equal(other.data.path, '/other');
+    // One session per origin, and only the requests still open reached the HTTPS origin.
+    assert.deepEqual([sessions - startSessions, streams - startStreams], [2, 3]);
+
+    // An open session serves requests with its own stream; get() returns its transport.
+    const direct = await client.get(originURL);
+    assert.ok(!posted.request.session && direct.request.session);
+    assert.equal(await transportPool.get(originURL + '/path'), await transportPool.get(new URL(originURL)));
+    assert.notEqual(await transportPool.get(cleartextURL), await transportPool.get(originURL));
+    assert.equal(sessions - startSessions, 2);
 });
 
 test('pool options are copied at creation and failed opens are not cached', async (t) => {
@@ -325,7 +355,8 @@ test('pool options are copied at creation and failed opens are not cached', asyn
     assert.equal(ipProxy.requests.at(-1).headers['x-route'], 'original');
 
     const denied = createHttp2TransportPool({ ...options(ipProxy), proxyRequestOptions: { ca: ipCert.cert, headers: { 'x-deny': '1' } } });
-    for (let i = 0; i < 2; i++) await assert.rejects(denied.get(originURL), { message: 'PROXY HTTP 407' });
+    await assert.rejects(denied.get(originURL), { message: 'PROXY HTTP 407' });
+    await assert.rejects(axios.get(originURL, { transport: denied, proxy: false }), { message: 'PROXY HTTP 407' });
     assert.equal(ipProxy.requests.length - start, 3);
 });
 
@@ -335,7 +366,8 @@ test('pool close cancels ongoing CONNECT and immediately allows new gets for the
     const transportPool = createHttp2TransportPool({ ...options(server), connectTimeout: 0 });
     t.after(() => transportPool.close());
     const connected = once(server, 'connect');
-    const rejected = [1, 2].map(() => assert.rejects(transportPool.get(originURL), { message: 'POOL CLOSED' }));
+    const rejected = [transportPool.get(originURL), axios.get(originURL, { transport: transportPool, proxy: false })]
+        .map((pending) => assert.rejects(pending, { message: 'POOL CLOSED' }));
     const [, client] = await connected;
     const socketClosed = once(client, 'close');
     const drained = transportPool.close();

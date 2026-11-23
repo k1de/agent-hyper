@@ -19,10 +19,12 @@ npm install agent-hyper
 
 ```javascript
 import axios from 'axios'
-import { HttpsAgent } from 'agent-hyper' // HttpAgent for http:// targets
+import { HttpAgent, HttpsAgent } from 'agent-hyper'
 
 const client = axios.create({
-    httpsAgent: new HttpsAgent({ proxy: config.proxy }), // direct when config.proxy is not set
+    // direct when config.proxy is not set
+    httpAgent: new HttpAgent({ proxy: config.proxy }),
+    httpsAgent: new HttpsAgent({ proxy: config.proxy }),
     proxy: false,
 })
 await client.get('https://api.example.org/users')
@@ -45,48 +47,50 @@ Other `http.Agent` / `https.Agent` options pass through. `0` or `Infinity` disab
 Speaks HTTP/2 to the origin directly or through an HTTP/HTTPS proxy: `h2` via ALPN for HTTPS, cleartext `h2c` for HTTP.
 Receive windows match Chrome (6 MB per stream, 15 MB per connection), so large responses are not throttled on slow links.
 
-**Single transport** — one session for a batch of requests that you open and close yourself.
+**Pool** — recommended for most scenarios: one shared session per origin,
+opened by the first request and reopened by the next one after it closes.
+
+```javascript
+import { createHttp2TransportPool } from 'agent-hyper'
+
+const transportPool = createHttp2TransportPool({
+    proxy: 'http://localhost:8080',
+})
+const client = axios.create({
+    transport: transportPool,
+    proxy: false,
+})
+
+await client.get('https://api-a.example.org/users')
+await client.post('https://api-b.example.net/orders', { quantity: 1 })
+```
+
+**Single transport** — one session to one origin that you open and close yourself.
 It does not reconnect: once `transport.accepting` is `false`, create a new one.
 
 ```javascript
 import { createHttp2Transport } from 'agent-hyper'
 
-const transport = await createHttp2Transport('https://api.example.org', {
+const origin = 'https://api.example.org'
+const transport = await createHttp2Transport(origin, {
     proxy: 'http://localhost:8080',
 })
 try {
-    await axios.post('https://api.example.org/orders', { quantity: 1 }, {
+    const client = axios.create({
+        baseURL: origin,
         transport,
         proxy: false,
     })
+    await client.post('/orders', { quantity: 1 })
+    await client.get('/orders')
 } finally {
     await transport.close()
 }
 ```
 
 Axios does not follow redirects when a custom `transport` is set.
-
-**Pool** — for long-lived clients, with one origin or many: one shared session per origin,
-reopened on the next `get()` after it closes.
-
-```javascript
-import { createHttp2TransportPool } from 'agent-hyper'
-
-const transportPool = createHttp2TransportPool({ proxy: 'http://localhost:8080' })
-const client = async config => axios({
-    ...config,
-    proxy: false,
-    transport: await transportPool.get(axios.getUri(config)),
-})
-
-await client({ url: 'https://api-a.example.org/users' })
-await client({
-    method: 'post',
-    baseURL: 'https://api-b.example.net',
-    url: '/orders',
-    data: { quantity: 1 },
-})
-```
+A cancelled or timed-out request resets its stream at once, without sending the rest of the body;
+one cancelled while the pool is still opening its session is never sent.
 
 Both take the same options:
 
@@ -103,18 +107,18 @@ Both take the same options:
 ### Closing
 
 Closing is optional: idle sessions close by themselves after `idleTimeout`. `transport.close()` and
-`transportPool.close()` reject new requests at once, let the ones in flight finish and resolve when the sessions
-are closed. The pool also cancels connections still being set up; a later `get()` opens a new session.
+`transportPool.close()` stop their sessions from taking new requests, let the ones in flight finish and resolve
+when the sessions are closed. The pool also cancels connections still being set up, failing the requests waiting
+for them, and opens a new session for the next request.
 
-To stop without waiting for responses, give the pool client a shared signal and abort it before closing:
+To stop without waiting for responses, give the client a shared signal and abort it before closing:
 
 ```javascript
 const shutdown = new AbortController()
-const client = async config => axios({
-    ...config,
+const client = axios.create({
+    transport: transportPool,
     proxy: false,
     signal: shutdown.signal,
-    transport: await transportPool.get(axios.getUri(config)),
 })
 // …
 shutdown.abort()

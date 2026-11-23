@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import type { ClientHttp2Stream, IncomingHttpHeaders } from 'http2';
+import type { Writable } from 'stream';
 import type { ConnectionOptions } from 'tls';
 import { URL } from 'url';
 
@@ -80,6 +81,12 @@ interface Http2TransportOptions {
     idleTimeout?: number | undefined;
 }
 
+interface Http2RequestOptions extends Pick<http.RequestOptions, 'hostname' | 'host' | 'port' | 'protocol' | 'path' | 'method' | 'auth'> {
+    headers?: http.OutgoingHttpHeaders | undefined;
+}
+
+type Http2Response = ClientHttp2Stream & { statusCode: number; statusMessage: string; headers: IncomingHttpHeaders };
+
 interface Http2Transport {
     /** Connection setup limit the transport was opened with, in milliseconds; 0 when disabled. */
     readonly connectTimeout: number;
@@ -87,13 +94,8 @@ interface Http2Transport {
     readonly idleTimeout: number;
     /** False once the session is closing or closed; the transport does not reconnect. */
     readonly accepting: boolean;
-    request(options: Pick<http.RequestOptions, 'hostname' | 'host' | 'port' | 'protocol' | 'path' | 'method' | 'auth'> & {
-        headers?: http.OutgoingHttpHeaders | undefined;
-    }, callback?: (response: ClientHttp2Stream & {
-        statusCode: number;
-        statusMessage: string;
-        headers: IncomingHttpHeaders;
-    }) => void): ClientHttp2Stream;
+    /** The stream's close() resets it at once, without sending the rest of the body first. */
+    request(options: Http2RequestOptions, callback?: (response: Http2Response) => void): ClientHttp2Stream;
     /** Rejects new requests, lets sent ones finish, then closes the session. */
     close(): Promise<void>;
 }
@@ -105,6 +107,11 @@ interface Http2TransportPool {
     readonly connectTimeout: number;
     /** Idle session limit in milliseconds; 0 when disabled. */
     readonly idleTimeout: number;
+    /**
+     * Takes the origin from the options and returns at once, so the pool works as an axios `transport`.
+     * While the session opens, a stand-in holds the body and sends nothing if it is closed first.
+     */
+    request(options: Http2RequestOptions, callback?: (response: Http2Response) => void): Writable & Pick<ClientHttp2Stream, 'setTimeout'>;
     get(url: string | URL): Promise<Http2Transport>;
     /** Closes cached sessions, cancels pending ones and waits for them and earlier calls. The pool stays usable. */
     close(): Promise<void>;

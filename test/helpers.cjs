@@ -44,11 +44,11 @@ async function proxy(targets, credentials, host) {
         }
         const port = Number(req.url.split(':').pop());
         if (!targets.some((target) => target.address().port === port)) return client.destroy();
-        const upstream = net.connect(port, '127.0.0.1', () => {
+        const upstream = net.connect(port, '127.0.0.1', () => setTimeout(() => {
             client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
             if (head.length) upstream.write(head);
             upstream.pipe(client).pipe(upstream);
-        });
+        }, Number(req.headers['x-delay'] || 0)));
         upstream.on('error', () => client.destroy());
         upstream.on('close', () => client.destroy());
         client.on('close', () => upstream.destroy());

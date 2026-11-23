@@ -1,6 +1,6 @@
 {
     "name": "agent-hyper",
-    "version": "2.2.0",
+    "version": "3.0.0",
     "description": "HTTP/HTTPS agents with an optional proxy and an HTTP/2 client transport for Node.js",
     "main": "index.js",
     "types": "index.d.ts",

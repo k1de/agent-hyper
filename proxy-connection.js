@@ -53,12 +53,12 @@ function createProxyConnection(proxy, proxyRequestOptions, options, callback) {
             callback(null, socket);
         } else {
             socket.destroy();
-            callback(new Error(`PROXY HTTP ${response.statusCode}`), null);
+            callback(Object.assign(new Error(`PROXY HTTP ${response.statusCode}`), { code: 'PROXY_HTTP' }), null);
         }
     });
 
     request.once('timeout', () => {
-        request.destroy(new Error('PROXY TIMEOUT'));
+        request.destroy(Object.assign(new Error('PROXY TIMEOUT'), { code: 'PROXY_TIMEOUT' }));
     });
 
     request.once('error', (err) => {

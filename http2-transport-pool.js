@@ -66,7 +66,7 @@ class Http2TransportPool {
         const entries = Array.from(this.#byOrigin.values());
         this.#byOrigin.clear();
         const current = Promise.all(entries.map((entry) => {
-            entry.controller.abort(new Error('POOL CLOSED'));
+            entry.controller.abort(Object.assign(new Error('POOL CLOSED'), { code: 'POOL_CLOSED' }));
             if (entry.transport) return entry.transport.close();
             return entry.opening.then((transport) => transport.close(), () => {});
         }));
@@ -76,7 +76,9 @@ class Http2TransportPool {
     }
 
     #entry(target) {
-        if (target.protocol !== 'https:' && target.protocol !== 'http:') throw new TypeError('UNSUPPORTED ORIGIN SCHEME');
+        if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+            throw Object.assign(new TypeError('UNSUPPORTED ORIGIN SCHEME'), { code: 'UNSUPPORTED_ORIGIN_SCHEME' });
+        }
         const key = target.origin;
         const cached = this.#byOrigin.get(key);
         if (cached && (!cached.transport || cached.transport.accepting)) return cached;

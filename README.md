@@ -125,6 +125,24 @@ shutdown.abort()
 await transportPool.close()
 ```
 
+## Errors
+
+Errors created by the package carry a `code`; with axios it ends up in `error.code`.
+
+| Message | Code |
+| --- | --- |
+| `CONNECTION TIMEOUT` | `CONNECTION_TIMEOUT` |
+| `CONNECTION CLOSED` | `CONNECTION_CLOSED` |
+| `PROXY TIMEOUT` | `PROXY_TIMEOUT` |
+| `PROXY HTTP <status>` | `PROXY_HTTP` |
+| `PROXY REQUIRED` | `PROXY_REQUIRED` |
+| `HTTP/2 NOT SUPPORTED BY SERVER` | `HTTP2_NOT_SUPPORTED` |
+| `UNSUPPORTED ORIGIN SCHEME` | `UNSUPPORTED_ORIGIN_SCHEME` |
+| `REQUEST ORIGIN MISMATCH` | `REQUEST_ORIGIN_MISMATCH` |
+| `REQUEST CLOSED` | `REQUEST_CLOSED` |
+| `TRANSPORT CLOSED` | `TRANSPORT_CLOSED` |
+| `POOL CLOSED` | `POOL_CLOSED` |
+
 ## License
 
 MIT. Based on hpagent © 2020 Tomas Della Vedova.

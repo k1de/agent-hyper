@@ -109,7 +109,9 @@ test('request builds its own pseudo-headers and filters connection-specific fiel
 test('transports report unsupported schemes, keep URL parsing errors and treat an empty proxy as direct', async () => {
     const transportPool = createHttp2TransportPool();
     for (const open of [createHttp2Transport, transportPool.get]) {
-        await assert.rejects(open('ftp://localhost'), { name: 'TypeError', message: 'UNSUPPORTED ORIGIN SCHEME' });
+        await assert.rejects(open('ftp://localhost'), {
+            name: 'TypeError', message: 'UNSUPPORTED ORIGIN SCHEME', code: 'UNSUPPORTED_ORIGIN_SCHEME',
+        });
         await assert.rejects(open('invalid-url'), { code: 'ERR_INVALID_URL' });
     }
     assert.throws(() => transportPool.request({ protocol: 'ftp:', hostname: 'localhost' }), { message: 'UNSUPPORTED ORIGIN SCHEME' });
@@ -171,15 +173,16 @@ test('407 prevents a connection to the origin; HTTP/1-only servers are reported 
     const start = connections;
     await assert.rejects(createHttp2Transport(originURL, {
         ...options(tcpProxy), proxyRequestOptions: { headers: { 'x-deny': '1' } },
-    }), { message: 'PROXY HTTP 407' });
+    }), { message: 'PROXY HTTP 407', code: 'PROXY_HTTP' });
     assert.equal(connections - start, 0);
     // HTTPS refuses h2 in ALPN; cleartext h2c gets an HTTP/1 reply, kept as the cause.
+    const unsupported = { message: 'HTTP/2 NOT SUPPORTED BY SERVER', code: 'HTTP2_NOT_SUPPORTED' };
     const tlsServer = await listen(https.createServer({ ...ipCert, ALPNProtocols: [] }));
     await assert.rejects(createHttp2Transport('https://127.0.0.1:' + tlsServer.address().port,
-        { originTls: { ca: ipCert.cert } }), { message: 'HTTP/2 NOT SUPPORTED BY SERVER' });
+        { originTls: { ca: ipCert.cert } }), unsupported);
     const cleartextServer = await listen(http.createServer((_, res) => res.end()));
     await assert.rejects(createHttp2Transport('http://127.0.0.1:' + cleartextServer.address().port),
-        (err) => err.message === 'HTTP/2 NOT SUPPORTED BY SERVER' && err.cause.code === 'ERR_HTTP2_ERROR');
+        (err) => err.message === unsupported.message && err.code === unsupported.code && err.cause.code === 'ERR_HTTP2_ERROR');
 });
 
 test('h2c sends CONNECT to port 80 when the origin omits the port', async () => {
@@ -200,7 +203,9 @@ test('connectTimeout closes the peer socket during CONNECT, TLS and the HTTP/2 h
         await assert.rejects(createHttp2Transport(target, {
             proxy: server === tcpProxy ? tcpProxy.url : undefined, proxyRequestOptions: { headers: { 'x-stall': '1' } },
             originTls: { ca: ipCert.cert }, connectTimeout: 100,
-        }), { message: server === tcpProxy ? 'PROXY TIMEOUT' : 'CONNECTION TIMEOUT' });
+        }), server === tcpProxy
+            ? { message: 'PROXY TIMEOUT', code: 'PROXY_TIMEOUT' }
+            : { message: 'CONNECTION TIMEOUT', code: 'CONNECTION_TIMEOUT' });
         await received;
     }
 });
@@ -208,7 +213,7 @@ test('connectTimeout closes the peer socket during CONNECT, TLS and the HTTP/2 h
 test('a clean close during the HTTP/2 handshake is reported as such', async () => {
     const server = await listen(net.createServer((peer) => peer.once('data', () => peer.end())));
     await assert.rejects(createHttp2Transport('http://127.0.0.1:' + server.address().port), {
-        message: 'CONNECTION CLOSED', stage: 'http2-handshake',
+        message: 'CONNECTION CLOSED', code: 'CONNECTION_CLOSED', stage: 'http2-handshake',
     });
 });
 
@@ -233,7 +238,9 @@ test('a bound transport rejects other origins; timeout and cancellation reset th
     const start = connections;
     const beforeRequests = streams;
     for (const url of [originURL.replace('localhost', '127.0.0.1'), 'https://localhost', originURL.replace('https:', 'http:')]) {
-        await assert.rejects(axios.get(url, config), { name: 'TypeError', message: 'REQUEST ORIGIN MISMATCH' });
+        await assert.rejects(axios.get(url, config), {
+            name: 'TypeError', message: 'REQUEST ORIGIN MISMATCH', code: 'REQUEST_ORIGIN_MISMATCH',
+        });
     }
     assert.equal(connections, start);
     assert.equal(streams, beforeRequests);
@@ -257,7 +264,8 @@ test('a reset before response headers rejects the Axios request and preserves th
     const config = { transport, proxy: false, timeout: 10000 };
     origin.once('stream', (stream) => stream.close(http2.constants.NGHTTP2_CANCEL));
     await assert.rejects(axios.get(originURL + '/hold', config), (err) =>
-        axios.isAxiosError(err) && !err.response && err.message === 'REQUEST CLOSED' && err.cause.stage === 'awaiting-response');
+        axios.isAxiosError(err) && !err.response && err.message === 'REQUEST CLOSED' && err.code === 'REQUEST_CLOSED' &&
+        err.cause.stage === 'awaiting-response');
     assert.equal((await axios.get(originURL, config)).status, 201);
     assert.equal(sessions - start, 1);
 });
@@ -286,7 +294,7 @@ test('a failed session stops accepting requests and can be closed', async () => 
     session.goaway(http2.constants.NGHTTP2_INTERNAL_ERROR);
     for (let i = 0; transport.accepting && i < 100; i++) await new Promise((r) => setTimeout(r, 5));
     assert.equal(transport.accepting, false);
-    assert.throws(() => transport.request({}), { message: 'TRANSPORT CLOSED' });
+    assert.throws(() => transport.request({}), { message: 'TRANSPORT CLOSED', code: 'TRANSPORT_CLOSED' });
     await transport.close();
 });
 
@@ -367,7 +375,7 @@ test('pool close cancels ongoing CONNECT and immediately allows new gets for the
     t.after(() => transportPool.close());
     const connected = once(server, 'connect');
     const rejected = [transportPool.get(originURL), axios.get(originURL, { transport: transportPool, proxy: false })]
-        .map((pending) => assert.rejects(pending, { message: 'POOL CLOSED' }));
+        .map((pending) => assert.rejects(pending, { message: 'POOL CLOSED', code: 'POOL_CLOSED' }));
     const [, client] = await connected;
     const socketClosed = once(client, 'close');
     const drained = transportPool.close();

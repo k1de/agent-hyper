@@ -93,7 +93,7 @@ test('agents apply defaults, accept explicit overrides and the proxy variants re
     }
     for (const Agent of [HttpProxyAgent, HttpsProxyAgent]) {
         for (const options of [undefined, {}, { proxy: null }, { proxy: '' }]) {
-            assert.throws(() => new Agent(options), { name: 'TypeError', message: 'PROXY REQUIRED' });
+            assert.throws(() => new Agent(options), { name: 'TypeError', message: 'PROXY REQUIRED', code: 'PROXY_REQUIRED' });
         }
     }
 });
@@ -143,7 +143,8 @@ test('connectTimeout limits direct TCP and TLS setups and the TLS setup inside a
     // A lookup that never answers keeps the direct TCP connection from starting.
     const stalled = new HttpAgent({ connectTimeout: 100, lookup: () => {} });
     t.after(() => stalled.destroy());
-    await assert.rejects(get(new URL('http://stalled.example'), stalled), { message: 'CONNECTION TIMEOUT' });
+    const timedOut = { message: 'CONNECTION TIMEOUT', code: 'CONNECTION_TIMEOUT' };
+    await assert.rejects(get(new URL('http://stalled.example'), stalled), timedOut);
     const silent = await listen(net.createServer((peer) => peer.resume()));
     const tunnel = await proxy([silent]);
     const url = new URL('https://127.0.0.1:' + silent.address().port);
@@ -151,7 +152,7 @@ test('connectTimeout limits direct TCP and TLS setups and the TLS setup inside a
         const agent = new HttpsAgent({ ...options, connectTimeout: 100 });
         t.after(() => agent.destroy());
         const closed = once(silent, 'connection').then(([socket]) => once(socket, 'close'));
-        await assert.rejects(get(url, agent), { message: 'CONNECTION TIMEOUT' });
+        await assert.rejects(get(url, agent), timedOut);
         await closed;
     }
 });
@@ -168,11 +169,11 @@ test('agents verify an HTTPS proxy certificate against its IP', async (t) => {
 test('agents report CONNECT refusal and timeout without reaching the origin', { timeout: 3000 }, async (t) => {
     const initialConnections = connections;
     const start = httpProxy.requests.length;
-    for (const [header, message] of [['x-deny', 'PROXY HTTP 407'], ['x-stall', 'PROXY TIMEOUT']]) {
+    for (const [header, message, code] of [['x-deny', 'PROXY HTTP 407', 'PROXY_HTTP'], ['x-stall', 'PROXY TIMEOUT', 'PROXY_TIMEOUT']]) {
         const agent = new HttpsProxyAgent({ proxy: httpProxy.url, proxyRequestOptions: { headers: { [header]: '1' } }, connectTimeout: 150 });
         t.after(() => agent.destroy());
         const closed = once(httpProxy, 'connect').then(([, socket]) => once(socket, 'close'));
-        await assert.rejects(get(urls.https, agent), { message });
+        await assert.rejects(get(urls.https, agent), { message, code });
         await closed;
     }
     assert.equal(httpProxy.requests.length - start, 2);

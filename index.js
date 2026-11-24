@@ -17,7 +17,9 @@ const agentDefaults = {
 // the agent: Node may hand back a plain socket even from https.Agent (e.g. with its `proxyEnv` option).
 function limitSetup(socket, timeout) {
     if (!timeout) return socket;
-    const timer = setTimeout(() => socket.destroy(new Error('CONNECTION TIMEOUT')), timeout);
+    const timer = setTimeout(() => {
+        socket.destroy(Object.assign(new Error('CONNECTION TIMEOUT'), { code: 'CONNECTION_TIMEOUT' }));
+    }, timeout);
     const clear = () => clearTimeout(timer);
     socket.once(socket instanceof TLSSocket ? 'secureConnect' : 'connect', clear).once('close', clear);
     return socket;
@@ -78,7 +80,7 @@ class HttpsAgent extends withProxy(https.Agent) {
 // The proxy variants differ only in requiring a proxy.
 const requireProxy = (Agent) => class extends Agent {
     constructor(options = {}) {
-        if (!options.proxy) throw new TypeError('PROXY REQUIRED');
+        if (!options.proxy) throw Object.assign(new TypeError('PROXY REQUIRED'), { code: 'PROXY_REQUIRED' });
         super(options);
     }
 };
